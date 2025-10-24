@@ -4,8 +4,27 @@ export default async function handler(req, res) {
     return;
   }
   const payload = req.body;
+  let { symbol, exchangeSymbol, klines } = payload;
+  
+  // ✅ Handle stringified klines
   try {
-    const { symbol, exchangeSymbol, klines } = payload;
+    if (typeof klines === 'string') {
+      klines = JSON.parse(klines);
+    }
+    if (klines === null || typeof klines !== 'object') {
+      throw new Error('Invalid klines format: must be an object or JSON string of object');
+    }
+  } catch (err) {
+    res.status(400).json({
+      error: 'Failed to parse klines data',
+      details: err.message,
+      receivedType: typeof klines,
+    });
+    return;
+  }
+
+  
+  try {
     function toNum(v){ return typeof v==='number' ? v : parseFloat(v); }
     function sma(v,p){const o=new Array(v.length).fill(null);if(p<=0)return o;let s=0;for(let i=0;i<v.length;i++){s+=v[i];if(i>=p)s-=v[i-p];if(i>=p-1)o[i]=s/p;}return o;}
     function ema(v,p){const o=new Array(v.length).fill(null);const k=2/(p+1);let prev=v[0];o[0]=prev;for(let i=1;i<v.length;i++){prev=(v[i]*k)+(prev*(1-k));o[i]=prev;}for(let i=0;i<p-1&&i<o.length;i++)o[i]=null;return o;}
