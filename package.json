@@ -1,0 +1,11 @@
+{
+  "name": "trading-bot-engine",
+  "version": "1.0.0",
+  "description": "Indicator engine for trading bot",
+  "main": "api/indicators.js",
+  "scripts": {
+    "start": "vercel dev",
+    "deploy": "vercel --prod"
+  },
+  "dependencies": {}
+}
