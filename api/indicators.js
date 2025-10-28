@@ -402,6 +402,22 @@ export default async function handler(req, res) {
 
   if (atrRef == null && entryPrice != null) atrRef = entryPrice * 0.005; // fallback
 
+  if (entryLow != null && entryHigh != null && lastClose != null) {
+    if (final_signal === 'STRONG BUY') {
+      const f = 0.8;
+      entryLow = lastClose - (lastClose - entryLow) * f;
+      entryHigh = lastClose - (lastClose - entryHigh) * f;
+    } else if (final_signal === 'STRONG SELL') {
+      const f = 0.8;
+      entryLow = lastClose + (entryLow - lastClose) * f;
+      entryHigh = lastClose + (entryHigh - lastClose) * f;
+    } else if (final_signal === 'BUY' || final_signal === 'SELL') {
+      const f = 0.4;
+      entryLow = lastClose - (lastClose - entryLow) * f;
+      entryHigh = lastClose - (lastClose - entryHigh) * f;
+    }
+  }
+
   const slMultipliers = { level1: 1.2, level2: 1.8, level3: 2.8 };
   const suggestions = {};
   const levels = ['level1', 'level2', 'level3'];
