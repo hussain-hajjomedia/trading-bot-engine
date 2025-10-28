@@ -341,4 +341,130 @@ export default async function handler(req, res) {
   const stv = ref.indicators.supertrend;
   const lastCandle = normalized[refTf][normalized[refTf].length - 1];
 
-  const trend = final_signal
+  const trend = final_signal.includes('BUY')
+    ? 'UP'
+    : final_signal.includes('SELL')
+    ? 'DOWN'
+    : 'SIDEWAYS';
+  // ---------- Predictive entry logic ----------
+  const emaSafe = (v) => (v && !isNaN(v) ? v : null);
+  const stSafe = (v) => (v && !isNaN(v) ? v : null);
+
+  const emaVal = emaSafe(ema9v);
+  const stVal = stSafe(stv);
+  const lastClose = ref?.last?.close ?? null;
+
+  let entryLow = null;
+  let entryHigh = null;
+
+  if (trend === 'UP') {
+    // Buy zone between SuperTrend and EMA9
+    if (emaVal && stVal) {
+      entryLow = Math.min(emaVal, stVal);
+      entryHigh = emaVal;
+    } else {
+      entryLow = lastClose * 0.995;
+      entryHigh = lastClose * 1.005;
+    }
+  } else if (trend === 'DOWN') {
+    // Sell zone between EMA9 and SuperTrend
+    if (emaVal && stVal) {
+      entryLow = emaVal;
+      entryHigh = Math.max(emaVal, stVal);
+    } else {
+      entryLow = lastClose * 0.995;
+      entryHigh = lastClose * 1.005;
+    }
+  } else {
+    // Sideways market
+    entryLow = lastClose;
+    entryHigh = lastClose;
+  }
+
+  const entryPrice =
+    entryLow && entryHigh
+      ? (entryLow + entryHigh) / 2
+      : lastClose || null;
+
+  // ---------- ATR & SL/TP ----------
+  function pickAtr(tf) {
+    const r = tfResults[tf];
+    if (r?.indicators?.atr14 != null) return r.indicators.atr14;
+    return null;
+  }
+  let atrRef =
+    pickAtr(refTf) ||
+    pickAtr('15m') ||
+    pickAtr('1h') ||
+    pickAtr('4h') ||
+    pickAtr('1d') ||
+    null;
+
+  if (atrRef == null && entryPrice != null) atrRef = entryPrice * 0.005; // fallback
+
+  const slMultipliers = { level1: 1.2, level2: 1.8, level3: 2.8 };
+  const suggestions = {};
+  const levels = ['level1', 'level2', 'level3'];
+
+  for (const lvl of levels) {
+    const m = slMultipliers[lvl];
+    let sl, tp1, tp2;
+
+    if (trend === 'UP') {
+      sl = entryPrice - atrRef * m;
+      tp1 = entryPrice + atrRef * (m * 1.5);
+      tp2 = entryPrice + atrRef * (m * 3);
+    } else if (trend === 'DOWN') {
+      sl = entryPrice + atrRef * m;
+      tp1 = entryPrice - atrRef * (m * 1.5);
+      tp2 = entryPrice - atrRef * (m * 3);
+    } else {
+      sl = entryPrice - atrRef * m;
+      tp1 = entryPrice + atrRef * (m * 1.5);
+      tp2 = entryPrice + atrRef * (m * 3);
+    }
+
+    suggestions[lvl] = {
+      entry: entryPrice,
+      entry_range: { low: entryLow, high: entryHigh },
+      stop_loss: sl,
+      take_profit_1: tp1,
+      take_profit_2: tp2,
+      atr_used: atrRef,
+      sl_multiplier: m,
+    };
+  }
+
+  // ---------- Compose final output ----------
+  const votes = {};
+  for (const tf of Object.keys(tfResults)) votes[tf] = tfResults[tf].signal;
+
+  const reasons = [];
+  for (const tf of Object.keys(tfResults)) {
+    const r = tfResults[tf];
+    if (r.reasons?.length)
+      reasons.push({ timeframe: tf, score: r.score, reasons: r.reasons.slice(0, 6) });
+  }
+
+  const output = {
+    symbol: symbol || null,
+    exchangeSymbol: exchangeSymbol || null,
+    final_signal,
+    votesSummary: {
+      weighted: {
+        buyWeight: buyWeight,
+        sellWeight: sellWeight,
+        strongBuyWeight,
+        strongSellWeight,
+      },
+      byTf: votes,
+    },
+    suggestions,
+    reasons,
+    details: tfResults,
+  };
+
+  console.log('[indicators] final_signal=', final_signal, 'votesSummary=', output.votesSummary);
+  return res.status(200).json(output);
+}
+
