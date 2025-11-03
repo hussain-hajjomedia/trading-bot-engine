@@ -85,7 +85,7 @@ export default async function handler(req, res) {
         trades: safe(row.trades ?? row.n ?? null),
       };
     }
-    return { openTime: null, open: null, high: null, low: null, close: null, volume: null };
+    return { openTime: null, open: null, high: null, low: null, volume: null };
   }
 
   function normalizeCandlesRaw(raw) {
@@ -111,12 +111,7 @@ export default async function handler(req, res) {
     '1d': normalizeCandlesRaw(kline_1d),
   };
 
-  console.log('[indicators] symbol=', symbol, 'lengths=', {
-    '15m': normalized['15m'].length,
-    '1h': normalized['1h'].length,
-    '4h': normalized['4h'].length,
-    '1d': normalized['1d'].length,
-  });
+  console.log('[indicators] symbol=', symbol);
 
   // ---------- Indicator helpers ----------
   const toNum = (v) => (v == null ? null : Number(v));
@@ -222,7 +217,6 @@ export default async function handler(req, res) {
       if (i === 0) { finalUpper[i] = upper[i]; finalLower[i] = lower[i]; continue; }
       finalUpper[i] = Math.min(upper[i] == null ? Infinity : upper[i], finalUpper[i - 1] == null ? Infinity : finalUpper[i - 1]);
       finalLower[i] = Math.max(lower[i] == null ? -Infinity : lower[i], finalLower[i - 1] == null ? -Infinity : finalLower[i - 1]);
-      // safer check for nulls
       if (finalLower[i] == null || finalUpper[i] == null) st[i] = null;
       else st[i] = closes[i] > finalLower[i] ? finalLower[i] : finalUpper[i];
     }
@@ -234,7 +228,6 @@ export default async function handler(req, res) {
     for (let i = 0; i < values.length; i++) {
       if (i < period - 1) { out.push({ upper: null, middle: null, lower: null }); continue; }
       const slice = values.slice(i - period + 1, i + 1).filter(v => v != null);
-      if (slice.length < period) { out.push({ upper: null, middle: null, lower: null }); continue; }
       const mean = slice.reduce((a, b) => a + b, 0) / period;
       const variance = slice.reduce((a, b) => a + (b - mean) ** 2, 0) / period;
       const sd = Math.sqrt(variance);
@@ -243,14 +236,46 @@ export default async function handler(req, res) {
     return out;
   }
 
+  // ---------- SMC Swing Functions ----------
+  function findSwingPoints(candles, lookback = 2) {
+    const highs = candles.map(c => c.high);
+    const lows = candles.map(c => c.low);
+    const swingHighs = [];
+    const swingLows = [];
+
+    for (let i = lookback; i < highs.length - lookback; i++) {
+      let high = highs[i], low = lows[i];
+      let isSwingHigh = true, isSwingLow = true;
+      for (let j = 1; j <= lookback; j++) {
+        if (!(high > highs[i - j] && high > highs[i + j])) isSwingHigh = false;
+        if (!(low < lows[i - j] && low < lows[i + j])) isSwingLow = false;
+      }
+      if (isSwingHigh) swingHighs.push({ price: high });
+      if (isSwingLow) swingLows.push({ price: low });
+    }
+    return { swingHighs, swingLows };
+  }
+
+  function nearestSwingBelow(price, swings) {
+    let below = swings.filter(s => s.price < price).map(s => s.price);
+    if (!below.length) return null;
+    return Math.max(...below);
+  }
+
+  function nearestSwingAbove(price, swings) {
+    let above = swings.filter(s => s.price > price).map(s => s.price);
+    if (!above.length) return null;
+    return Math.min(...above);
+  }
+
   // ---------- Analysis ----------
   function analyzeTimeframe(tfName, candles) {
-    const result = { tf: tfName, length: candles.length, indicators: {}, last: {}, score: 0, reasons: [], signal: 'HOLD' };
+    const result = { tf: tfName, indicators: {}, last: {}, score: 0, reasons: [], signal: 'HOLD' };
     const closes = candles.map(c => toNum(c.close));
     const highs = candles.map(c => toNum(c.high));
     const lows = candles.map(c => toNum(c.low));
     const volumes = candles.map(c => toNum(c.volume));
-    if (closes.length < 5) { result.reasons.push('insufficient candles'); return result; }
+    if (closes.length < 5) return result;
 
     const sma50 = sma(closes, 50);
     const sma200 = sma(closes, 200);
@@ -261,12 +286,9 @@ export default async function handler(req, res) {
     const atr14 = atr(highs, lows, closes, 14);
     const st = superTrend(highs, lows, closes, 10, 3);
     const bb = bollinger(closes, 20, 2);
-
-    // volume sma20 for confirmation
     const volSMA20 = sma(volumes, 20);
-
     const i = closes.length - 1;
-    const last = { open: closes[i], high: highs[i], low: lows[i], close: closes[i], volume: volumes[i], time: candles[i].openTime };
+    const last = { close: closes[i], high: highs[i], low: lows[i], volume: volumes[i], time: candles[i].openTime };
     result.last = last;
 
     result.indicators = {
@@ -277,104 +299,54 @@ export default async function handler(req, res) {
       vol_sma20: volSMA20[i], volume: volumes[i]
     };
 
-    let score = 0;
-    const reasons = [];
+    let score = 0, reasons = [];
+    const sma50v = result.indicators.sma50, sma200v = result.indicators.sma200;
+    let sidewaysFactor = 1;
 
-    // regime detection: if SMA50 is very close to SMA200, we are in sideways market
-    const sma50v = result.indicators.sma50;
-    const sma200v = result.indicators.sma200;
-    let sidewaysFactor = 1; // default no reduction
     if (sma50v != null && sma200v != null) {
       const diffPct = Math.abs(sma50v - sma200v) / Math.max(1, Math.abs(sma200v));
-      // if within 0.8% -> strongly sideways; 0.8-2% -> somewhat sideways
       if (diffPct < 0.008) sidewaysFactor = 0.35;
       else if (diffPct < 0.02) sidewaysFactor = 0.7;
-      else sidewaysFactor = 1;
-      if (sidewaysFactor < 1) reasons.push('market appears sideways (SMA50≈SMA200)');
     }
 
-    // time-frame weighting (per-tf multipliers applied at caller level; here we compute base contributions)
-    // base contributions (these will be multiplied by tfWeight when aggregating across TFs)
-    // Adjusted (smaller per-item values to avoid runaway scores)
-    if (last.close != null && result.indicators.sma50 != null) {
-      if (last.close > result.indicators.sma50) { score += 6 * sidewaysFactor; reasons.push('price > SMA50'); }
-      else { score -= 6 * sidewaysFactor; reasons.push('price < SMA50'); }
-    }
+    if (last.close > sma50v) score += 6 * sidewaysFactor;
+    else score -= 6 * sidewaysFactor;
+    if (sma50v > sma200v) score += 8 * sidewaysFactor;
+    else score -= 8 * sidewaysFactor;
+    if (last.close > result.indicators.ema9) score += 5 * sidewaysFactor;
+    else score -= 5 * sidewaysFactor;
+    if (result.indicators.ema9 > result.indicators.ema21) score += 3 * sidewaysFactor;
+    else score -= 3 * sidewaysFactor;
 
-    if (result.indicators.sma50 != null && result.indicators.sma200 != null) {
-      if (result.indicators.sma50 > result.indicators.sma200) { score += 8 * sidewaysFactor; reasons.push('SMA50 > SMA200'); }
-      else { score -= 8 * sidewaysFactor; reasons.push('SMA50 < SMA200'); }
-    }
+    if (result.indicators.macd > result.indicators.macd_signal && result.indicators.macd_hist > 0)
+      score += 10 * sidewaysFactor;
+    else if (result.indicators.macd < result.indicators.macd_signal && result.indicators.macd_hist < 0)
+      score -= 10 * sidewaysFactor;
 
-    if (last.close != null && result.indicators.ema9 != null) {
-      if (last.close > result.indicators.ema9) { score += 5 * sidewaysFactor; reasons.push('price > EMA9'); }
-      else { score -= 5 * sidewaysFactor; reasons.push('price < EMA9'); }
-    }
+    if (last.close > result.indicators.supertrend) score += 7 * sidewaysFactor;
+    else score -= 7 * sidewaysFactor;
 
-    if (result.indicators.ema9 != null && result.indicators.ema21 != null) {
-      if (result.indicators.ema9 > result.indicators.ema21) { score += 3 * sidewaysFactor; reasons.push('EMA9 > EMA21'); }
-      else { score -= 3 * sidewaysFactor; reasons.push('EMA9 < EMA21'); }
-    }
+    if (result.indicators.rsi14 < 30) score += 2;
+    if (result.indicators.rsi14 > 70) score -= 2;
+    if (result.indicators.volume > result.indicators.vol_sma20 * 1.25) score += 6;
+    if (result.indicators.volume < result.indicators.vol_sma20 * 0.7) score -= 3;
 
-    // MACD confirmation
-    if (result.indicators.macd != null && result.indicators.macd_signal != null && result.indicators.macd_hist != null) {
-      if (result.indicators.macd > result.indicators.macd_signal && result.indicators.macd_hist > 0) { score += 10 * sidewaysFactor; reasons.push('MACD bullish'); }
-      else if (result.indicators.macd < result.indicators.macd_signal && result.indicators.macd_hist < 0) { score -= 10 * sidewaysFactor; reasons.push('MACD bearish'); }
-    }
-
-    // SuperTrend
-    if (result.indicators.supertrend != null && last.close != null) {
-      if (last.close > result.indicators.supertrend) { score += 7 * sidewaysFactor; reasons.push('SuperTrend bullish'); }
-      else { score -= 7 * sidewaysFactor; reasons.push('SuperTrend bearish'); }
-    }
-
-    // RSI mild adjustments (avoid huge weights)
-    if (result.indicators.rsi14 != null) {
-      if (result.indicators.rsi14 < 30) { score += 2 * sidewaysFactor; reasons.push('RSI oversold'); }
-      else if (result.indicators.rsi14 > 70) { score -= 2 * sidewaysFactor; reasons.push('RSI overbought'); }
-    }
-
-    // Bollinger context (small weight)
-    if (result.indicators.bb_upper != null && result.indicators.bb_lower != null) {
-      if (last.close > result.indicators.bb_upper) { score += 1 * sidewaysFactor; reasons.push('price above BB upper'); }
-      else if (last.close < result.indicators.bb_lower) { score += 1 * sidewaysFactor; reasons.push('price below BB lower'); }
-    }
-
-    // Volume confirmation (important for swing)
-    if (result.indicators.volume != null && result.indicators.vol_sma20 != null) {
-      if (result.indicators.volume > result.indicators.vol_sma20 * 1.25) {
-        score += 6 * sidewaysFactor;
-        reasons.push('volume spike (vol > 1.25x volSMA20)');
-      } else if (result.indicators.volume < result.indicators.vol_sma20 * 0.7) {
-        score -= 3 * sidewaysFactor;
-        reasons.push('below average volume');
-      }
-    }
-
-    // cap score to avoid runaway
     result.score = Math.max(-100, Math.min(100, Math.round(score)));
     if (result.score >= 30) result.signal = 'STRONG BUY';
     else if (result.score >= 12) result.signal = 'BUY';
     else if (result.score <= -30) result.signal = 'STRONG SELL';
     else if (result.score <= -12) result.signal = 'SELL';
-    else result.signal = 'HOLD';
 
-    result.reasons = reasons;
     return result;
   }
 
   const tfResults = {};
   for (const tf of Object.keys(normalized)) tfResults[tf] = analyzeTimeframe(tf, normalized[tf]);
 
-  // ---------- Voting (swing-optimized weights) ----------
-  // Increased weight for larger TFs, reduced small TF influence
   const tfWeight = { '15m': 0.5, '1h': 1.5, '4h': 2.5, '1d': 3.5 };
   const tally = { BUY: 0, SELL: 0, HOLD: 0, 'STRONG BUY': 0, 'STRONG SELL': 0 };
-  for (const tf of Object.keys(tfResults)) {
-    const s = tfResults[tf].signal;
-    const w = tfWeight[tf] || 1;
-    tally[s] += w;
-  }
+
+  for (const tf of Object.keys(tfResults)) tally[tfResults[tf].signal] += tfWeight[tf] || 1;
 
   let final_signal = 'HOLD';
   const strongBuyWeight = tally['STRONG BUY'];
@@ -382,210 +354,103 @@ export default async function handler(req, res) {
   const buyWeight = tally['BUY'] + strongBuyWeight * 1.5;
   const sellWeight = tally['SELL'] + strongSellWeight * 1.5;
 
-  // swing-tuned thresholds (higher bar to classify)
   if (strongBuyWeight >= 3.5 && buyWeight > sellWeight) final_signal = 'STRONG BUY';
   else if (strongSellWeight >= 3.5 && sellWeight > buyWeight) final_signal = 'STRONG SELL';
   else if (buyWeight >= sellWeight && buyWeight >= 3.5) final_signal = 'BUY';
   else if (sellWeight > buyWeight && sellWeight >= 3.5) final_signal = 'SELL';
-  else final_signal = 'HOLD';
 
-  // ---------- Entry & Targets (swing-tuned, capped ranges) ----------
   const refTf = tfResults['1h']?.last?.close ? '1h' : tfResults['15m']?.last?.close ? '15m' : '4h';
   const ref = tfResults[refTf];
-  const ema9v = ref.indicators.ema9;
-  const stv = ref.indicators.supertrend;
-  const lastCandle = normalized[refTf][normalized[refTf].length - 1];
+  const emaVal = ref.indicators.ema9;
+  const stVal = ref.indicators.supertrend;
+  const lastClose = ref.last.close;
 
-  const trend = final_signal.includes('BUY')
-    ? 'UP'
-    : final_signal.includes('SELL')
-    ? 'DOWN'
-    : 'SIDEWAYS';
-
-  const emaSafe = (v) => (v != null && !isNaN(v) ? v : null);
-  const stSafe = (v) => (v != null && !isNaN(v) ? v : null);
-
-  const emaVal = emaSafe(ema9v);
-  const stVal = stSafe(stv);
-  const lastClose = ref?.last?.close ?? null;
-
-  // determine ATR reference (prefer 1h/4h/1d for swing sizing)
   function pickAtr(tf) {
     const r = tfResults[tf];
-    if (r?.indicators?.atr14 != null) return r.indicators.atr14;
-    return null;
+    return r?.indicators?.atr14 ?? null;
   }
-  let atrRef =
-    pickAtr('1h') ||
-    pickAtr('4h') ||
-    pickAtr('1d') ||
-    pickAtr('15m') ||
-    null;
 
-  if (atrRef == null && lastClose != null) atrRef = lastClose * 0.005; // fallback small volatility estimate
+  let atrRef = pickAtr('1h') || pickAtr('4h') || pickAtr('1d') || pickAtr('15m');
 
-  // entry range logic with caps: define max allowed pct moves (swing-friendly)
-  const MAX_ENTRY_PCT = 0.015; // 1.5% for level1 base maximum
-  const MAX_ENTRY_PCT_L2 = 0.03; // 3%
-  const MAX_ENTRY_PCT_L3 = 0.05; // 5%
-  const MIN_ENTRY_PCT = 0.001; // 0.1% minimal range
+  const swings4h = findSwingPoints(normalized['4h']);
+  const swings1h = findSwingPoints(normalized['1h']);
 
-  // initial raw entryLow/high computation (similar to prior logic but we will clamp)
-  let rawEntryLow = null, rawEntryHigh = null;
-  if (trend === 'UP') {
-    if (emaVal && stVal) {
-      rawEntryLow = Math.min(emaVal, stVal);
-      rawEntryHigh = emaVal;
-    } else if (emaVal) {
-      rawEntryLow = emaVal * 0.995;
-      rawEntryHigh = emaVal * 1.005;
-    } else {
-      rawEntryLow = lastClose * 0.995;
-      rawEntryHigh = lastClose * 1.005;
-    }
-  } else if (trend === 'DOWN') {
-    if (emaVal && stVal) {
-      rawEntryLow = emaVal;
-      rawEntryHigh = Math.max(emaVal, stVal);
-    } else if (emaVal) {
-      rawEntryLow = emaVal * 0.995;
-      rawEntryHigh = emaVal * 1.005;
-    } else {
-      rawEntryLow = lastClose * 0.995;
-      rawEntryHigh = lastClose * 1.005;
-    }
+  const price = lastClose;
+  const swingLow4h = nearestSwingBelow(price, swings4h.swingLows);
+  const swingHigh4h = nearestSwingAbove(price, swings4h.swingHighs);
+  const swingLow1h = nearestSwingBelow(price, swings1h.swingLows);
+  const swingHigh1h = nearestSwingAbove(price, swings1h.swingHighs);
+
+  const structureLow = swingLow4h ?? swingLow1h ?? (price - atrRef * 2);
+  const structureHigh = swingHigh4h ?? swingHigh1h ?? (price + atrRef * 2);
+
+  function blend(a, b, weight = 0.5) {
+    if (a == null) return b;
+    if (b == null) return a;
+    return a * weight + b * (1 - weight);
+  }
+
+  let rawEntryLow, rawEntryHigh;
+  if (final_signal.includes('BUY')) {
+    rawEntryLow = blend(Math.min(emaVal, stVal), structureLow, 0.6);
+    rawEntryHigh = blend(emaVal, price, 0.6);
+  } else if (final_signal.includes('SELL')) {
+    rawEntryLow = blend(price, emaVal, 0.6);
+    rawEntryHigh = blend(Math.max(emaVal, stVal), structureHigh, 0.6);
   } else {
-    rawEntryLow = lastClose;
-    rawEntryHigh = lastClose;
+    rawEntryLow = price;
+    rawEntryHigh = price;
   }
 
-  // Helper to clamp entry ranges to sensible swing-friendly percentages around lastClose and relative to ATR
-  function clampEntryRange(rawLow, rawHigh, lastPrice, maxPct) {
-    if (!lastPrice || rawLow == null || rawHigh == null) return { low: rawLow, high: rawHigh };
-    // ensure rawLow <= rawHigh
-    if (rawLow > rawHigh) { const tmp = rawLow; rawLow = rawHigh; rawHigh = tmp; }
+  const entry = (rawEntryLow + rawEntryHigh) / 2;
 
-    // compute distance from last price and clamp
-    const lowPct = Math.abs((rawLow - lastPrice) / lastPrice);
-    const highPct = Math.abs((rawHigh - lastPrice) / lastPrice);
-
-    const cappedLow = lowPct > maxPct ? (rawLow < lastPrice ? lastPrice * (1 - maxPct) : lastPrice * (1 + maxPct)) : rawLow;
-    const cappedHigh = highPct > maxPct ? (rawHigh < lastPrice ? lastPrice * (1 - maxPct) : lastPrice * (1 + maxPct)) : rawHigh;
-
-    // ensure the range is not too tiny: at least MIN_ENTRY_PCT percent width
-    let finalLow = Math.min(cappedLow, cappedHigh);
-    let finalHigh = Math.max(cappedLow, cappedHigh);
-    const widthPct = Math.abs((finalHigh - finalLow) / Math.max(1, lastPrice));
-    if (widthPct < MIN_ENTRY_PCT) {
-      // expand symmetrically
-      const half = (MIN_ENTRY_PCT * lastPrice) / 2;
-      finalLow = lastPrice - half;
-      finalHigh = lastPrice + half;
-    }
-    return { low: finalLow, high: finalHigh };
-  }
-
-  // base entry range (level1, level2, level3) with progressive maxPct
-  const lvl1 = clampEntryRange(rawEntryLow, rawEntryHigh, lastClose, MAX_ENTRY_PCT);
-  const lvl2 = clampEntryRange(rawEntryLow, rawEntryHigh, lastClose, MAX_ENTRY_PCT_L2);
-  const lvl3 = clampEntryRange(rawEntryLow, rawEntryHigh, lastClose, MAX_ENTRY_PCT_L3);
-
-  // Use ATR to further limit unrealistic SL/TP values
-  const entryPrice =
-    (lvl1.low != null && lvl1.high != null) ? (lvl1.low + lvl1.high) / 2
-    : (lastClose != null ? lastClose : null);
-
-  // ---------- ATR & SL/TP (swing-tuned, more conservative sizing) ----------
-  const slMultipliers = { level1: 1.0, level2: 1.6, level3: 2.4 }; // tightened compared to prior
   const suggestions = {};
   const levels = ['level1', 'level2', 'level3'];
-  const rawRanges = { level1: lvl1, level2: lvl2, level3: lvl3 };
+  const slMultipliers = { level1: 1.0, level2: 1.6, level3: 2.4 };
 
   for (const lvl of levels) {
     const m = slMultipliers[lvl];
-    let sl = null, tp1 = null, tp2 = null;
+    let sl, tp1, tp2;
 
-    const range = rawRanges[lvl];
-    // ensure entry within that range
-    const entry = entryPrice != null ? entryPrice : (range.low != null ? (range.low + range.high) / 2 : null);
-
-    if (entry == null || atrRef == null) {
-      // fallback: small absolute SL/TP
-      sl = entry ? entry - (entry * 0.01) : null;
-      tp1 = entry ? entry + (entry * 0.015) : null;
-      tp2 = entry ? entry + (entry * 0.03) : null;
+    if (final_signal.includes('BUY')) {
+      const structuralSL = structureLow != null ? structureLow * 0.997 : entry - atrRef * m;
+      sl = Math.min(structuralSL, entry - atrRef * m);
+      tp1 = entry + atrRef * (m * 1.2);
+      tp2 = entry + atrRef * (m * 2.2);
+    } else if (final_signal.includes('SELL')) {
+      const structuralSL = structureHigh != null ? structureHigh * 1.003 : entry + atrRef * m;
+      sl = Math.max(structuralSL, entry + atrRef * m);
+      tp1 = entry - atrRef * (m * 1.2);
+      tp2 = entry - atrRef * (m * 2.2);
     } else {
-      if (trend === 'UP') {
-        sl = entry - atrRef * m;
-        tp1 = entry + atrRef * (m * 1.2);
-        tp2 = entry + atrRef * (m * 2.2);
-      } else if (trend === 'DOWN') {
-        sl = entry + atrRef * m;
-        tp1 = entry - atrRef * (m * 1.2);
-        tp2 = entry - atrRef * (m * 2.2);
-      } else {
-        // sideways small targets
-        sl = entry - atrRef * m;
-        tp1 = entry + atrRef * (m * 0.8);
-        tp2 = entry + atrRef * (m * 1.6);
-      }
-    }
-
-    // Final safety clamps: do not propose SL farther than MAX_ENTRY_PCT_L3 from entry
-    const maxSLDistance = Math.max( Math.abs(entry * MAX_ENTRY_PCT_L3), atrRef * 0.5 );
-    if (sl != null && Math.abs(sl - entry) > maxSLDistance) {
-      sl = entry - Math.sign(entry - sl) * maxSLDistance;
-    }
-
-    // same for TP
-    const maxTPDistance = Math.max( Math.abs(entry * 0.08), atrRef * 4 ); // allow reasonable upside
-    if (tp1 != null && Math.abs(tp1 - entry) > maxTPDistance) {
-      tp1 = entry + Math.sign(tp1 - entry) * maxTPDistance;
-    }
-    if (tp2 != null && Math.abs(tp2 - entry) > maxTPDistance * 1.6) {
-      tp2 = entry + Math.sign(tp2 - entry) * maxTPDistance * 1.6;
+      sl = entry - atrRef * m;
+      tp1 = entry + atrRef * (m * 0.8);
+      tp2 = entry + atrRef * (m * 1.6);
     }
 
     suggestions[lvl] = {
-      entry: entry,
-      entry_range: { low: range.low, high: range.high },
+      entry,
+      entry_range: { low: rawEntryLow, high: rawEntryHigh },
       stop_loss: sl,
       take_profit_1: tp1,
       take_profit_2: tp2,
       atr_used: atrRef,
-      sl_multiplier: m,
+      sl_multiplier: m
     };
   }
 
-  // ---------- Compose final output ----------
   const votes = {};
   for (const tf of Object.keys(tfResults)) votes[tf] = tfResults[tf].signal;
 
-  const reasons = [];
-  for (const tf of Object.keys(tfResults)) {
-    const r = tfResults[tf];
-    if (r.reasons?.length)
-      reasons.push({ timeframe: tf, score: r.score, reasons: r.reasons.slice(0, 6) });
-  }
-
   const output = {
-    symbol: symbol || null,
-    exchangeSymbol: exchangeSymbol || null,
+    symbol,
+    exchangeSymbol,
     final_signal,
-    votesSummary: {
-      weighted: {
-        buyWeight: buyWeight,
-        sellWeight: sellWeight,
-        strongBuyWeight,
-        strongSellWeight,
-      },
-      byTf: votes,
-    },
+    votesSummary: { byTf: votes },
     suggestions,
-    reasons,
-    details: tfResults,
+    reasons: [],
+    details: tfResults
   };
 
-  console.log('[indicators] final_signal=', final_signal, 'votesSummary=', output.votesSummary);
   return res.status(200).json(output);
 }
