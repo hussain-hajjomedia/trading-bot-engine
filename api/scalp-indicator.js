@@ -1,4 +1,5 @@
-// api/indicators.js  — SCALP VERSION (keeps exact output shape)
+// api/indicators.js — SCALP + CONDITIONAL FIBONACCI PULLBACK (A-only)
+// Output format unchanged. Always returns SL/TP for level1/2/3.
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
@@ -13,13 +14,10 @@ export default async function handler(req, res) {
   function tryParseMaybeJson(input) {
     if (input === undefined || input === null) return null;
     if (Array.isArray(input)) return input;
-    if (typeof input === 'string') {
-      try { return JSON.parse(input); } catch { return input; }
-    }
+    if (typeof input === 'string') { try { return JSON.parse(input); } catch { return input; } }
     if (typeof input === 'object') return input;
     return null;
   }
-
   function extractArrayFromPossibleWrapper(x) {
     if (x === undefined || x === null) return [];
     if (Array.isArray(x)) return x;
@@ -29,7 +27,6 @@ export default async function handler(req, res) {
     }
     return [];
   }
-
   function parseInputField(field) {
     const p = tryParseMaybeJson(field);
     return extractArrayFromPossibleWrapper(p);
@@ -50,7 +47,6 @@ export default async function handler(req, res) {
     }
     return arr;
   }
-
   function normalizeCandleRow(row) {
     if (!row) return { openTime: null, open: null, high: null, low: null, close: null, volume: null };
     const safe = (v) => {
@@ -62,8 +58,8 @@ export default async function handler(req, res) {
       return {
         openTime: safe(row[0]),
         open: safe(row[1]),
-        high: safe(row[2]),
-        low: safe(row[3]),
+        high:  safe(row[2]),
+        low:   safe(row[3]),
         close: safe(row[4]),
         volume: safe(row[5]),
         closeTime: safe(row[6]),
@@ -72,18 +68,17 @@ export default async function handler(req, res) {
     } else if (typeof row === 'object') {
       return {
         openTime: safe(row.openTime ?? row.t ?? row.time ?? row.timestamp ?? null),
-        open: safe(row.open ?? row.o ?? row.price ?? null),
-        high: safe(row.high ?? row.h ?? null),
-        low: safe(row.low ?? row.l ?? null),
+        open:  safe(row.open ?? row.o ?? row.price ?? null),
+        high:  safe(row.high ?? row.h ?? null),
+        low:   safe(row.low  ?? row.l ?? null),
         close: safe(row.close ?? row.c ?? null),
         volume: safe(row.volume ?? row.v ?? null),
         closeTime: safe(row.closeTime ?? null),
         trades: safe(row.trades ?? row.n ?? null),
       };
     }
-    return { openTime: null, open: null, high: null, low: null, volume: null };
+    return { openTime: null, open: null, high: null, low: null, close: null, volume: null };
   }
-
   function normalizeCandlesRaw(raw) {
     if (!raw) return [];
     if (Array.isArray(raw) && raw.length > 0 && !Array.isArray(raw[0])) {
@@ -109,7 +104,6 @@ export default async function handler(req, res) {
 
   // ---------- Indicator helpers ----------
   const toNum = (v) => (v == null ? null : Number(v));
-
   function sma(values, period) {
     const out = new Array(values.length).fill(null);
     if (period <= 0) return out;
@@ -122,7 +116,6 @@ export default async function handler(req, res) {
     }
     return out;
   }
-
   function ema(values, period) {
     const out = new Array(values.length).fill(null);
     if (period <= 0) return out;
@@ -137,7 +130,6 @@ export default async function handler(req, res) {
     for (let i = 0; i < period - 1 && i < out.length; i++) out[i] = null;
     return out;
   }
-
   function rsiWilder(values, period = 14) {
     const out = new Array(values.length).fill(null);
     if (values.length < period + 1) return out;
@@ -158,7 +150,6 @@ export default async function handler(req, res) {
     }
     return out;
   }
-
   function macd(values, fast = 12, slow = 26, signal = 9) {
     const emaFast = ema(values, fast);
     const emaSlow = ema(values, slow);
@@ -171,7 +162,6 @@ export default async function handler(req, res) {
     );
     return { macdLine, signalLine, hist };
   }
-
   function trueRange(highs, lows, closes) {
     const tr = [];
     for (let i = 0; i < highs.length; i++) {
@@ -185,7 +175,6 @@ export default async function handler(req, res) {
     }
     return tr;
   }
-
   function atr(highs, lows, closes, period = 14) {
     const tr = trueRange(highs, lows, closes);
     const out = new Array(tr.length).fill(null);
@@ -196,7 +185,6 @@ export default async function handler(req, res) {
     }
     return out;
   }
-
   function superTrend(highs, lows, closes, period = 10, mult = 3) {
     const atrArr = atr(highs, lows, closes, period);
     const hl2 = highs.map((h, i) => (h + lows[i]) / 2);
@@ -215,26 +203,13 @@ export default async function handler(req, res) {
     return st;
   }
 
-  function bollinger(values, period = 20, mult = 2) {
-    const out = [];
-    for (let i = 0; i < values.length; i++) {
-      if (i < period - 1) { out.push({ upper: null, middle: null, lower: null }); continue; }
-      const slice = values.slice(i - period + 1, i + 1).filter(v => v != null);
-      const mean = slice.reduce((a, b) => a + b, 0) / period;
-      const variance = slice.reduce((a, b) => a + (b - mean) ** 2, 0) / period;
-      const sd = Math.sqrt(variance);
-      out.push({ upper: mean + mult * sd, middle: mean, lower: mean - mult * sd });
-    }
-    return out;
-  }
-
-  // ---------- Swing/scalp helpers ----------
+  // ---------- Micro-structure (swing points) ----------
   function findSwingPoints(candles, lookback = 2) {
     const highs = candles.map(c => c.high);
     const lows  = candles.map(c => c.low);
     const swingHighs = [], swingLows = [];
     for (let i = lookback; i < highs.length - lookback; i++) {
-      let high = highs[i], low = lows[i];
+      const high = highs[i], low = lows[i];
       let isHigh = true, isLow = true;
       for (let j = 1; j <= lookback; j++) {
         if (!(high > highs[i - j] && high > highs[i + j])) isHigh = false;
@@ -245,38 +220,24 @@ export default async function handler(req, res) {
     }
     return { swingHighs, swingLows };
   }
-  function nearestSwingBelow(price, swings) {
-    const below = swings.filter(s => s.price < price).map(s => s.price);
-    if (!below.length) return null;
-    return Math.max(...below);
-  }
-  function nearestSwingAbove(price, swings) {
-    const above = swings.filter(s => s.price > price).map(s => s.price);
-    if (!above.length) return null;
-    return Math.min(...above);
-  }
 
-  // ---------- Timeframe analysis ----------
   function analyzeTimeframe(tfName, candles) {
-    // For scalp, emphasize fast signals and recent bars
     const result = { tf: tfName, indicators: {}, last: {}, score: 0, reasons: [], signal: 'HOLD' };
     const closes  = candles.map(c => toNum(c.close));
     const highs   = candles.map(c => toNum(c.high));
     const lows    = candles.map(c => toNum(c.low));
     const volumes = candles.map(c => toNum(c.volume));
-    if (closes.length < 20) return result; // need enough for BB/ATR
+    if (closes.length < 5) return result;
 
+    // Scalp set
     const sma50    = sma(closes, 50);
     const sma200   = sma(closes, 200);
     const ema9Arr  = ema(closes, 9);
     const ema21Arr = ema(closes, 21);
     const rsi14    = rsiWilder(closes, 14);
-    const macdObj  = macd(closes, 8, 21, 5);        // CHANGE: faster MACD for scalp
-    const atr7Arr  = atr(highs, lows, closes, 7);   // CHANGE: faster ATR for scalp sizing
-    const atr14Arr = atr(highs, lows, closes, 14);
+    const macdObj  = macd(closes);
+    const atr7Arr  = atr(highs, lows, closes, 7);
     const stArr    = superTrend(highs, lows, closes, 10, 3);
-    const bb       = bollinger(closes, 20, 2);
-    const volSMA20 = sma(volumes, 20);
 
     const i = closes.length - 1;
     const last = { close: closes[i], high: highs[i], low: lows[i], volume: volumes[i], time: candles[i].openTime };
@@ -287,55 +248,26 @@ export default async function handler(req, res) {
       ema9: ema9Arr[i], ema21: ema21Arr[i],
       rsi14: rsi14[i],
       macd: macdObj.macdLine[i], macd_signal: macdObj.signalLine[i], macd_hist: macdObj.hist[i],
-      atr7: atr7Arr[i], atr14: atr14Arr[i],
+      atr7: atr7Arr[i],
       supertrend: stArr[i],
-      bb_upper: bb[i]?.upper, bb_mid: bb[i]?.middle, bb_lower: bb[i]?.lower,
-      vol_sma20: volSMA20[i], volume: volumes[i]
+      volume: volumes[i],
     };
 
-    // Scoring: price vs EMA9/21 has more weight, MACD fast, BB pierces, volume bursts
+    // Scalp scoring
     let score = 0;
-    const ema9v = result.indicators.ema9, ema21v = result.indicators.ema21;
-
-    // Sideways throttle using 50/200 gap
-    const sma50v = result.indicators.sma50, sma200v = result.indicators.sma200;
-    let sidewaysFactor = 1;
-    if (sma50v != null && sma200v != null) {
-      const diffPct = Math.abs(sma50v - sma200v) / Math.max(1, Math.abs(sma200v));
-      if (diffPct < 0.006) sidewaysFactor = 0.3;
-      else if (diffPct < 0.015) sidewaysFactor = 0.7;
-    }
-
-    // Fast momentum
-    if (last.close != null && ema9v != null) score += (last.close > ema9v ? 7 : -7) * sidewaysFactor;
-    if (ema9v != null && ema21v != null)     score += (ema9v > ema21v ? 5 : -5) * sidewaysFactor;
-
-    // MACD fast
+    if (last.close != null && result.indicators.ema9 != null) score += (last.close > result.indicators.ema9 ? 8 : -8);
+    if (result.indicators.ema9 != null && result.indicators.ema21 != null) score += (result.indicators.ema9 > result.indicators.ema21 ? 6 : -6);
     if (result.indicators.macd != null && result.indicators.macd_signal != null && result.indicators.macd_hist != null) {
-      if (result.indicators.macd > result.indicators.macd_signal && result.indicators.macd_hist > 0) score += 8 * sidewaysFactor;
-      else if (result.indicators.macd < result.indicators.macd_signal && result.indicators.macd_hist < 0) score -= 8 * sidewaysFactor;
+      if (result.indicators.macd > result.indicators.macd_signal && result.indicators.macd_hist > 0) score += 8;
+      else if (result.indicators.macd < result.indicators.macd_signal && result.indicators.macd_hist < 0) score -= 8;
     }
-
-    // BB pierce for mean reversion edges (small)
-    if (result.indicators.bb_upper != null && result.indicators.bb_lower != null) {
-      if (last.close > result.indicators.bb_upper) score -= 2;  // stretched up -> mean revert risk
-      if (last.close < result.indicators.bb_lower) score += 2;  // stretched down
-    }
-
-    // SuperTrend context
-    if (result.indicators.supertrend != null && last.close != null)
-      score += (last.close > result.indicators.supertrend ? 4 : -4) * sidewaysFactor;
-
-    // Volume burst
-    if (result.indicators.volume != null && result.indicators.vol_sma20 != null) {
-      if (result.indicators.volume > result.indicators.vol_sma20 * 1.4) score += 5;
-      else if (result.indicators.volume < result.indicators.vol_sma20 * 0.6) score -= 2;
-    }
+    if (result.indicators.supertrend != null && last.close != null) score += (last.close > result.indicators.supertrend ? 7 : -7);
+    if (result.indicators.rsi14 != null) { if (result.indicators.rsi14 < 30) score += 2; else if (result.indicators.rsi14 > 70) score -= 2; }
 
     result.score = Math.max(-100, Math.min(100, Math.round(score)));
-    if (result.score >= 22) result.signal = 'STRONG BUY';
+    if (result.score >= 26) result.signal = 'STRONG BUY';
     else if (result.score >= 10) result.signal = 'BUY';
-    else if (result.score <= -22) result.signal = 'STRONG SELL';
+    else if (result.score <= -26) result.signal = 'STRONG SELL';
     else if (result.score <= -10) result.signal = 'SELL';
     else result.signal = 'HOLD';
 
@@ -345,250 +277,242 @@ export default async function handler(req, res) {
   const tfResults = {};
   for (const tf of Object.keys(normalized)) tfResults[tf] = analyzeTimeframe(tf, normalized[tf]);
 
-  // ---------- Voting (SCALP weights) ----------
-  // Emphasize 15m heavily, 1h as higher-TF filter, 4h/1d as weak bias only.
-  const tfWeight = { '15m': 3.0, '1h': 1.2, '4h': 0.5, '1d': 0.3 };
+  // ---------- Voting (scalp bias) ----------
+  const tfWeight = { '15m': 3.0, '1h': 1.5, '4h': 0.5, '1d': 0.2 };
   const tally = { BUY: 0, SELL: 0, HOLD: 0, 'STRONG BUY': 0, 'STRONG SELL': 0 };
   for (const tf of Object.keys(tfResults)) {
     const s = tfResults[tf].signal;
     const w = tfWeight[tf] || 1;
     tally[s] += w;
   }
-
   let final_signal = 'HOLD';
   const strongBuyWeight  = tally['STRONG BUY'];
   const strongSellWeight = tally['STRONG SELL'];
-  const buyWeight  = tally['BUY']  + strongBuyWeight  * 1.4;
-  const sellWeight = tally['SELL'] + strongSellWeight * 1.4;
+  const buyWeight  = tally['BUY']  + strongBuyWeight  * 1.3;
+  const sellWeight = tally['SELL'] + strongSellWeight * 1.3;
 
-  // For scalp we lower absolute thresholds but require 1h not to be opposite-strong
-  if (strongBuyWeight >= 2.6 && buyWeight > sellWeight) final_signal = 'STRONG BUY';
-  else if (strongSellWeight >= 2.6 && sellWeight > buyWeight) final_signal = 'STRONG SELL';
+  if (strongBuyWeight >= 2.5 && buyWeight > sellWeight) final_signal = 'STRONG BUY';
+  else if (strongSellWeight >= 2.5 && sellWeight > buyWeight) final_signal = 'STRONG SELL';
   else if (buyWeight >= sellWeight && buyWeight >= 3.0) final_signal = 'BUY';
   else if (sellWeight > buyWeight && sellWeight >= 3.0) final_signal = 'SELL';
   else final_signal = 'HOLD';
 
-  // ---------- Regime Detection (light filter for scalp) ----------
-  function mean(arr) {
-    const v = arr.filter(x => x != null);
-    if (!v.length) return null;
-    return v.reduce((a, b) => a + b, 0) / v.length;
-  }
-
-  function detectRegime() {
-    const r15 = tfResults['15m'];
-    const r1h = tfResults['1h'];
-    if (!r15 || !r1h) return 'NEUTRAL';
-
-    // 15m ATR7 percentile vs its 30-bar average
+  // ---------- ATR reference (15m ATR7 preferred) ----------
+  function atr15() {
+    const r15 = tfResults['15m']?.indicators?.atr7;
+    if (r15 != null) return r15;
     const highs = normalized['15m'].map(c => c.high);
     const lows  = normalized['15m'].map(c => c.low);
     const closes= normalized['15m'].map(c => c.close);
-    const atr7 = atr(highs, lows, closes, 7);
-    const lastAtr = atr7[atr7.length - 1] ?? null;
-    const win = atr7.slice(-30).filter(x => x != null);
-    const base = mean(win);
-    const hot  = lastAtr && base ? lastAtr > base * 1.35 : false;
-    const cold = lastAtr && base ? lastAtr < base * 0.7  : false;
-
-    if (hot)  return 'FAST';
-    if (cold) return 'SLOW';
-    // align with 1h bias
-    const biasUp   = r1h && r1h.signal.includes('BUY');
-    const biasDown = r1h && r1h.signal.includes('SELL');
-    if (biasUp)   return 'BIAS_UP';
-    if (biasDown) return 'BIAS_DOWN';
-    return 'NEUTRAL';
+    const arr = atr(highs, lows, closes, 7);
+    return arr[arr.length - 1] ?? null;
   }
+  const lastClose15 = tfResults['15m']?.last?.close ?? null;
+  const atrRef = (() => {
+    const a = atr15();
+    if (a != null) return a;
+    return lastClose15 != null ? lastClose15 * 0.003 : 1; // fallback
+  })();
 
-  const marketRegime = detectRegime();
-
-  // ---------- Entry & Targets (scalp playbook) ----------
-  // Anchor on 15m; 1h used as bias filter; 4h/1d only for veto in extremes
-  const refTf = '15m';
-  const ref   = tfResults[refTf];
-  const price = ref?.last?.close ?? null;
-  const ema9v = ref?.indicators?.ema9 ?? null;
-  const ema21v= ref?.indicators?.ema21 ?? null;
-  const stv   = ref?.indicators?.supertrend ?? null;
-  const bbU   = ref?.indicators?.bb_upper ?? null;
-  const bbL   = ref?.indicators?.bb_lower ?? null;
-
-  // Scalp ATR reference: prefer ATR7 on 15m; fallback to ATR14 15m, then 1h ATR7
-  function pickAtrScalp() {
-    const r15 = tfResults['15m'], r1h = tfResults['1h'];
-    if (r15?.indicators?.atr7 != null)  return r15.indicators.atr7;
-    if (r15?.indicators?.atr14 != null) return r15.indicators.atr14;
-    if (r1h?.indicators?.atr7 != null)  return r1h.indicators.atr7;
-    return price != null ? price * 0.0035 : null; // ~0.35% fallback
+  // ---------- Conditional Fibonacci (A: pullback-only) ----------
+  // Find latest impulse on 15m using swing points
+  const swings15 = findSwingPoints(normalized['15m']);
+  function latestImpulseFromSwings(sw) {
+    if (!sw || !sw.swingHighs.length || !sw.swingLows.length) return null;
+    const lastHigh = sw.swingHighs[sw.swingHighs.length - 1];
+    const lastLow  = sw.swingLows [sw.swingLows .length - 1];
+    // Determine order by index (which came later)
+    if (lastLow.index < lastHigh.index) {
+      // Up impulse low -> high
+      return { dir: 'UP', low: lastLow.price, high: lastHigh.price, iLow: lastLow.index, iHigh: lastHigh.index };
+    } else if (lastHigh.index < lastLow.index) {
+      // Down impulse high -> low
+      return { dir: 'DOWN', high: lastHigh.price, low: lastLow.price, iHigh: lastHigh.index, iLow: lastLow.index };
+    }
+    return null;
   }
-  const atrRef = pickAtrScalp();
+  const impulse = latestImpulseFromSwings(swings15);
 
-  // Micro structure (15m)
-  const swings15 = findSwingPoints(normalized['15m'], 2);
-  const swingLow15  = nearestSwingBelow(price, swings15.swingLows);
-  const swingHigh15 = nearestSwingAbove(price, swings15.swingHighs);
+  // Confirm impulse strength (leg >= 3x ATR or >= 0.35% of price)
+  const price15 = lastClose15;
+  const legSize = (impulse && impulse.high != null && impulse.low != null) ? Math.abs(impulse.high - impulse.low) : null;
+  const strongImpulse =
+    legSize != null &&
+    atrRef != null &&
+    (legSize >= atrRef * 3 || (price15 != null && legSize / price15 >= 0.0035));
 
-  // Direction
-  const dir =
-    final_signal.includes('BUY')  ? 'UP'  :
-    final_signal.includes('SELL') ? 'DOWN': 'SIDEWAYS';
+  // Directional and timeframe alignment (15m + 1h)
+  const sig15 = tfResults['15m']?.signal || 'HOLD';
+  const sig1h = tfResults['1h']?.signal  || 'HOLD';
+  const alignedUp   = (sig15.includes('BUY')  && sig1h.includes('BUY'));
+  const alignedDown = (sig15.includes('SELL') && sig1h.includes('SELL'));
 
-  // Build a tight entry band around EMA9/EMA21 with BB guardrails
-  function buildScalpEntry(dir, p, e9, e21, bbUpper, bbLower) {
-    if (p == null) return { low: null, high: null };
-    const maxPct = 0.006; // 0.6% default width cap for scalp L1
-    if (dir === 'UP') {
-      const baseLow  = Math.min(e9 ?? p, e21 ?? p);
-      const baseHigh = e9 ?? p;
-      let low  = baseLow != null ? baseLow : p * 0.998;
-      let high = baseHigh != null ? baseHigh : p * 1.002;
-      // don’t place low below BB lower in up bias
-      if (bbLower != null) low = Math.max(low, bbLower);
-      // cap width
-      const width = Math.abs(high - low);
-      const cap   = p * maxPct;
-      if (width > cap) {
-        const mid = (low + high) / 2;
-        low  = mid - cap / 2;
-        high = mid + cap / 2;
-      }
-      return { low, high };
-    } else if (dir === 'DOWN') {
-      const baseLow  = e9 ?? p;
-      const baseHigh = Math.max(e9 ?? p, e21 ?? p);
-      let low  = baseLow  != null ? baseLow  : p * 0.998;
-      let high = baseHigh != null ? baseHigh : p * 1.002;
-      // don’t place high above BB upper in down bias
-      if (bbUpper != null) high = Math.min(high, bbUpper);
-      const width = Math.abs(high - low);
-      const cap   = p * maxPct;
-      if (width > cap) {
-        const mid = (low + high) / 2;
-        low  = mid - cap / 2;
-        high = mid + cap / 2;
-      }
-      // ensure correct ordering
-      if (low > high) { const t = low; low = high; high = t; }
-      return { low, high };
+  // Activate Fib only if impulse strong AND aligned with multi-TF bias AND final signal agrees
+  const fibModeActive =
+    impulse &&
+    strongImpulse &&
+    (
+      (impulse.dir === 'UP'   && alignedUp   && final_signal.includes('BUY')) ||
+      (impulse.dir === 'DOWN' && alignedDown && final_signal.includes('SELL'))
+    );
+
+  // Compute Fib prices for pullback (0.5–0.618) and extension (1.272)
+  function fibPullbackAndTargets(imp) {
+    if (!imp || imp.low == null || imp.high == null) return null;
+    const low = imp.low, high = imp.high;
+    const leg = Math.abs(high - low);
+    if (!Number.isFinite(leg) || leg === 0) return null;
+
+    if (imp.dir === 'UP') {
+      const fib50  = low + 0.50 * leg;
+      const fib618 = low + 0.618 * leg;
+      const ext1272 = low + 1.272 * leg;
+      return { dir: 'UP', pullLow: Math.min(fib50, fib618), pullHigh: Math.max(fib50, fib618), swingStop: low, tp1: high, tp2: ext1272 };
     } else {
-      return { low: p * 0.999, high: p * 1.001 };
+      const fib50  = high - 0.50 * leg;
+      const fib618 = high - 0.618 * leg;
+      const ext1272 = high - 1.272 * leg;
+      return { dir: 'DOWN', pullLow: Math.min(fib50, fib618), pullHigh: Math.max(fib50, fib618), swingStop: high, tp1: low, tp2: ext1272 };
     }
   }
+  const fib = fibModeActive ? fibPullbackAndTargets(impulse) : null;
 
-  const lvl1Band = buildScalpEntry(dir, price, ema9v, ema21v, bbU, bbL);
+  // ---------- Entry band ----------
+  const ema15 = tfResults['15m']?.indicators?.ema9 ?? lastClose15 ?? null;
+  const st15  = tfResults['15m']?.indicators?.supertrend ?? lastClose15 ?? null;
+  const trend =
+    final_signal.includes('BUY') ? 'UP' :
+    final_signal.includes('SELL') ? 'DOWN' : 'SIDEWAYS';
 
-  // Level widths for L2/L3 slightly larger
-  function widen(band, p, pct) {
-    if (!band || band.low == null || band.high == null || !p) return band;
-    const mid = (band.low + band.high) / 2;
-    const half = p * pct / 2;
-    return { low: mid - half, high: mid + half };
-  }
-  const lvl2Band = widen(lvl1Band, price, 0.010); // 1.0%
-  const lvl3Band = widen(lvl1Band, price, 0.016); // 1.6%
-
-  // Stop: beyond nearest swing + small ATR buffer
-  function scalpStop(dir, entry, swingLow, swingHigh, atr) {
-    if (entry == null) return null;
-    const buf = Math.max(atr * 0.6, entry * 0.0015); // 0.15% min
-    if (dir === 'UP')   return Math.min(entry - buf, swingLow  != null ? swingLow  - buf * 0.3 : entry - buf);
-    if (dir === 'DOWN') return Math.max(entry + buf, swingHigh != null ? swingHigh + buf * 0.3 : entry + buf);
-    return dir;
-  }
-
-  // Entry price = mid of L1 band
-  const entryPrice = (lvl1Band.low != null && lvl1Band.high != null) ? (lvl1Band.low + lvl1Band.high) / 2 : price;
-
-  const slL1 = scalpStop(dir, entryPrice, swingLow15, swingHigh15, atrRef);
-
-  // Targets: R-multiples for scalps; boost a bit if 1h bias agrees
-  const oneHBiasUp   = tfResults['1h']?.signal.includes('BUY');
-  const oneHBiasDown = tfResults['1h']?.signal.includes('SELL');
-  let biasBoost = 1.0;
-  if ((dir === 'UP' && oneHBiasUp) || (dir === 'DOWN' && oneHBiasDown)) biasBoost = 1.15;
-
-  function rMultipleTargets(dir, entry, stop, r1 = 1.0, r2 = 2.0) {
-    if (entry == null || stop == null) return { tp1: null, tp2: null };
-    const risk = Math.abs(entry - stop);
-    if (risk === 0) return { tp1: null, tp2: null };
-    if (dir === 'UP')   return { tp1: entry + risk * r1 * biasBoost, tp2: entry + risk * r2 * biasBoost };
-    if (dir === 'DOWN') return { tp1: entry - risk * r1 * biasBoost, tp2: entry - risk * r2 * biasBoost };
-    return { tp1: null, tp2: null };
-  }
-  const { tp1: tp1L1, tp2: tp2L1 } = rMultipleTargets(dir, entryPrice, slL1, 1.0, 2.0);
-
-  // Build suggestions for level2/3 using slightly wider bands and larger risk buffers
-  function scaleStop(dir, entry, swingLow, swingHigh, atr, mult) {
-    const base = scalpStop(dir, entry, swingLow, swingHigh, atr);
-    if (base == null) return null;
-    if (dir === 'UP')   return base + (entry - base) * (mult - 1);  // farther
-    if (dir === 'DOWN') return base - (base - entry) * (mult - 1);
-    return base;
+  // Clamp helper
+  function clampBandAround(p, rawLow, rawHigh, maxPct, minPctWidth) {
+    if (p == null || rawLow == null || rawHigh == null) return { low: rawLow, high: rawHigh };
+    let lo = Math.min(rawLow, rawHigh);
+    let hi = Math.max(rawLow, rawHigh);
+    const maxAbs = p * maxPct;
+    if (Math.abs(lo - p) > maxAbs) lo = p - maxAbs;
+    if (Math.abs(hi - p) > maxAbs) hi = p + maxAbs;
+    const minWidth = p * minPctWidth;
+    if ((hi - lo) < minWidth) { lo = p - minWidth / 2; hi = p + minWidth / 2; }
+    return { low: lo, high: hi };
   }
 
-  const lvlStops = {
-    level1: slL1,
-    level2: scaleStop(dir, entryPrice, swingLow15, swingHigh15, atrRef, 1.3),
-    level3: scaleStop(dir, entryPrice, swingLow15, swingHigh15, atrRef, 1.6),
-  };
-
-  const lvlTargets = {
-    level1: { tp1: tp1L1, tp2: tp2L1 },
-    level2: rMultipleTargets(dir, entryPrice, lvlStops.level2, 1.0, 2.2),
-    level3: rMultipleTargets(dir, entryPrice, lvlStops.level3, 1.0, 2.5),
-  };
-
-  // Confluence veto: avoid trading against strong 1h if 15m signal is weak
-  const reasons = [];
-  if (dir === 'UP') {
-    if (tfResults['1h']?.signal.includes('SELL') && Math.max(buyWeight, sellWeight) < 3.6) {
-      final_signal = 'HOLD';
-      reasons.push('VETO: 1h bias opposite and 15m edge not strong');
-    }
-  } else if (dir === 'DOWN') {
-    if (tfResults['1h']?.signal.includes('BUY') && Math.max(buyWeight, sellWeight) < 3.6) {
-      final_signal = 'HOLD';
-      reasons.push('VETO: 1h bias opposite and 15m edge not strong');
+  // Base bands: if Fib active, use 0.5–0.618 zone (with ATR padding); else EMA/ST bands
+  function bandsForLevels() {
+    const p = price15;
+    if (fib && fibModeActive) {
+      // Pad the fib pullback zone by ATR fractions per level
+      const pad1 = atrRef * 0.10;
+      const pad2 = atrRef * 0.20;
+      const pad3 = atrRef * 0.35;
+      const baseLow  = fib.pullLow;
+      const baseHigh = fib.pullHigh;
+      return {
+        level1: clampBandAround(p, baseLow  - pad1, baseHigh + pad1, 0.006, 0.0005), // 0.6% cap
+        level2: clampBandAround(p, baseLow  - pad2, baseHigh + pad2, 0.008, 0.0008), // 0.8%
+        level3: clampBandAround(p, baseLow  - pad3, baseHigh + pad3, 0.012, 0.0010), // 1.2%
+      };
+    } else {
+      // Non-fib fallback: EMA/ST bands (tight)
+      let rawLow, rawHigh;
+      if (trend === 'UP') { rawLow = Math.min(ema15, st15); rawHigh = ema15; }
+      else if (trend === 'DOWN') { rawLow = ema15; rawHigh = Math.max(ema15, st15); }
+      else { rawLow = p; rawHigh = p; }
+      return {
+        level1: clampBandAround(p, rawLow, rawHigh, 0.004, 0.0005), // 0.4%
+        level2: clampBandAround(p, rawLow, rawHigh, 0.006, 0.0008), // 0.6%
+        level3: clampBandAround(p, rawLow, rawHigh, 0.010, 0.0010), // 1.0%
+      };
     }
   }
+  const bands = bandsForLevels();
 
-  // Suggestions object (unchanged shape)
+  // Entry price = mid of level1 band (consistent)
+  const entryPrice = (() => {
+    const b = bands.level1;
+    if (b && b.low != null && b.high != null) return (b.low + b.high) / 2;
+    return price15 ?? tfResults['1h']?.last?.close ?? null;
+  })();
+
+  // ---------- Stops & Targets ----------
+  // Scalp multipliers (tight)
+  const slMultipliers = { level1: 0.8, level2: 1.1, level3: 1.5 };
+
+  function limitExtremes(entry, val, pct, factor = 1) {
+    if (!Number.isFinite(entry) || !Number.isFinite(val)) return val;
+    const cap = entry * pct * factor;
+    if (Math.abs(val - entry) > cap) return entry + Math.sign(val - entry) * cap;
+    return val;
+  }
+
+  function computeStopsAndTargets(dir, entry, atrVal, m) {
+    const e = Number.isFinite(entry) ? entry : (Number.isFinite(price15) ? price15 : null);
+    const a = Number.isFinite(atrVal) ? atrVal : (e != null ? e * 0.003 : 1);
+    if (e == null) return { sl: null, tp1: null, tp2: null };
+
+    let sl, tp1, tp2;
+
+    if (fib && fibModeActive) {
+      // Use structure + fib extension for TPs
+      if (dir === 'UP') {
+        const structuralSL = (fib.swingStop != null) ? (fib.swingStop - a * 0.10) : (e - a * m);
+        sl  = Math.min(structuralSL, e - a * m);
+        tp1 = Number.isFinite(fib.tp1) ? fib.tp1 : (e + a * m * 1.0);
+        tp2 = Number.isFinite(fib.tp2) ? fib.tp2 : (e + a * m * 2.0);
+      } else if (dir === 'DOWN') {
+        const structuralSL = (fib.swingStop != null) ? (fib.swingStop + a * 0.10) : (e + a * m);
+        sl  = Math.max(structuralSL, e + a * m);
+        tp1 = Number.isFinite(fib.tp1) ? fib.tp1 : (e - a * m * 1.0);
+        tp2 = Number.isFinite(fib.tp2) ? fib.tp2 : (e - a * m * 2.0);
+      } else {
+        sl  = e - a * m;
+        tp1 = e + a * m * 0.8;
+        tp2 = e + a * m * 1.6;
+      }
+    } else {
+      // Non-fib fallback
+      if (dir === 'UP') {
+        sl  = e - a * m;
+        tp1 = e + a * m * 1.0;
+        tp2 = e + a * m * 2.0;
+      } else if (dir === 'DOWN') {
+        sl  = e + a * m;
+        tp1 = e - a * m * 1.0;
+        tp2 = e - a * m * 2.0;
+      } else {
+        sl  = e - a * m;
+        tp1 = e + a * m * 0.8;
+        tp2 = e + a * m * 1.6;
+      }
+    }
+
+    // Safety caps (scalp): 2% from entry, TP2 up to 3%
+    sl  = limitExtremes(e, sl, 0.02, 1.0);
+    tp1 = limitExtremes(e, tp1, 0.02, 1.0);
+    tp2 = limitExtremes(e, tp2, 0.03, 1.0);
+
+    return { sl, tp1, tp2 };
+  }
+
+  // Assemble suggestions
   const suggestions = {};
-  function bandFor(level) {
-    if (level === 'level1') return lvl1Band;
-    if (level === 'level2') return lvl2Band;
-    return lvl3Band;
-  }
-  for (const level of ['level1', 'level2', 'level3']) {
-    const band = bandFor(level);
-    const stop = lvlStops[level];
-    const tps  = lvlTargets[level];
-    suggestions[level] = {
+  for (const lvl of ['level1', 'level2', 'level3']) {
+    const m = slMultipliers[lvl];
+    const band = bands[lvl] || bands.level1;
+    const { sl, tp1, tp2 } = computeStopsAndTargets(trend, entryPrice, atrRef, m);
+
+    suggestions[lvl] = {
       entry: entryPrice,
-      entry_range: { low: band.low, high: band.high },
-      stop_loss: stop,
-      take_profit_1: tps.tp1,
-      take_profit_2: tps.tp2,
+      entry_range: { low: band?.low ?? entryPrice, high: band?.high ?? entryPrice },
+      stop_loss: sl,
+      take_profit_1: tp1,
+      take_profit_2: tp2,
       atr_used: atrRef,
-      sl_multiplier: level === 'level1' ? 1.0 : level === 'level2' ? 1.3 : 1.6,
+      sl_multiplier: m,
     };
   }
 
-  // Build readable reasons for the client
-  const refDet = tfResults['15m'];
-  if (refDet) {
-    const r = refDet.indicators;
-    if (dir === 'UP') reasons.push('15m EMA9 > EMA21 and price above EMA9 (momentum up)');
-    if (dir === 'DOWN') reasons.push('15m EMA9 < EMA21 and price below EMA9 (momentum down)');
-    if (refDet.indicators.volume && refDet.indicators.vol_sma20 && refDet.indicators.volume > refDet.indicators.vol_sma20 * 1.4) {
-      reasons.push('Volume expansion on 15m (breakouts more reliable)');
-    }
-    if (stv != null && price != null) reasons.push(price > stv ? 'Above SuperTrend' : 'Below SuperTrend');
-    if (marketRegime === 'FAST') reasons.push('Fast volatility regime — tighter stops, quick targets');
-    if (marketRegime === 'SLOW') reasons.push('Slow volatility regime — expect slower follow-through');
-  }
-
+  // ---------- Output (unchanged schema) ----------
   const votes = {};
   for (const tf of Object.keys(tfResults)) votes[tf] = tfResults[tf].signal;
 
@@ -598,8 +522,8 @@ export default async function handler(req, res) {
     final_signal,
     votesSummary: { byTf: votes },
     suggestions,
-    reasons,
-    details: tfResults
+    reasons: [],        // kept empty for your sheet
+    details: tfResults, // full TF data
   };
 
   return res.status(200).json(output);
