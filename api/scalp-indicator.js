@@ -297,8 +297,7 @@ export default async function handler(req, res) {
   else if (sellWeight > buyWeight && sellWeight >= 3.0) final_signal = 'SELL';
   else final_signal = 'HOLD';
 
-
-// ---------- ATR reference (multi-TF average) ----------
+  // ---------- ATR reference (multi-TF average) ----------
   function atrCombined() {
     const a15 = tfResults['15m']?.indicators?.atr7 ?? null;
     const a1h = tfResults['1h']?.indicators?.atr7 ?? null;
@@ -316,16 +315,16 @@ export default async function handler(req, res) {
     return ref != null ? ref * 0.003 : 1;
   })();
 
-
-// ---------- Conditional Fibonacci (pullback-only) ----------
+  // ---------- Conditional Fibonacci (pullback-only) ----------
   const swings15 = findSwingPoints(normalized['15m']);
   const swings1h = findSwingPoints(normalized['1h']);
-  
+
   function pickImpulse() {
     function impulseFrom(sw) {
-      if (!sw || !sw.swingHighs.length || !sw.swingLows.length) return null;
-      const hi = sw.swingHighs.at(-1);
-      const lo = sw.swingLows.at(-1);
+      if (!sw || !Array.isArray(sw.swingHighs) || !Array.isArray(sw.swingLows)) return null;
+      if (sw.swingHighs.length === 0 || sw.swingLows.length === 0) return null;
+      const hi = sw.swingHighs[sw.swingHighs.length - 1];
+      const lo = sw.swingLows[sw.swingLows.length - 1];
       if (lo.index < hi.index) return { dir: 'UP', low: lo.price, high: hi.price };
       if (hi.index < lo.index) return { dir: 'DOWN', high: hi.price, low: lo.price };
       return null;
@@ -334,12 +333,11 @@ export default async function handler(req, res) {
     const imp1h = impulseFrom(swings1h);
     if (!imp15) return imp1h;
     if (!imp1h) return imp15;
-    const size15 = Math.abs(imp15.high - imp15.low);
-    const size1h = Math.abs(imp1h.high - imp1h.low);
-    return size1h > size15 * 1.5 ? imp1h : imp15; // prefer stronger leg
+    const size15 = (imp15.high != null && imp15.low != null) ? Math.abs(imp15.high - imp15.low) : 0;
+    const size1h = (imp1h.high != null && imp1h.low != null) ? Math.abs(imp1h.high - imp1h.low) : 0;
+    return (size1h > size15 * 1.5) ? imp1h : imp15; // prefer stronger leg
   }
   const impulse = pickImpulse();
-
 
   // Confirm impulse strength (leg >= 3x ATR or >= 0.35% of price)
   const price15 = lastClose15;
@@ -383,7 +381,7 @@ export default async function handler(req, res) {
       return { dir: 'DOWN', pullLow: Math.min(fib50, fib618), pullHigh: Math.max(fib50, fib618), swingStop: high, tp1: low, tp2: ext1272 };
     }
   }
-   const fib = fibModeActive ? fibPullbackAndTargets(impulse) : null;
+  const fib = fibModeActive ? fibPullbackAndTargets(impulse) : null;
 
   // ---------- Entry band ----------
   // Combine 15m + 1h for more accurate scalp structure
@@ -392,16 +390,12 @@ export default async function handler(req, res) {
   const st15  = tfResults['15m']?.indicators?.supertrend;
   const st1h  = tfResults['1h']?.indicators?.supertrend;
 
-  const lastClose15 = tfResults['15m']?.last?.close ?? null;
-  const lastClose1h = tfResults['1h']?.last?.close ?? null;
-
+  // basePrice computed using available EMAs/last closes (defined earlier)
   const basePrice = (ema15 && ema1h)
     ? (ema15 * 0.6 + ema1h * 0.4)
     : (ema15 ?? ema1h ?? lastClose15 ?? lastClose1h);
 
   // Determine multi-timeframe trend alignment
-  const sig15 = tfResults['15m']?.signal || 'HOLD';
-  const sig1h = tfResults['1h']?.signal  || 'HOLD';
   const trend =
     (sig15.includes('BUY') && sig1h.includes('BUY')) ? 'UP' :
     (sig15.includes('SELL') && sig1h.includes('SELL')) ? 'DOWN' :
@@ -460,7 +454,6 @@ export default async function handler(req, res) {
     if (b && b.low != null && b.high != null) return (b.low + b.high) / 2;
     return basePrice;
   })();
-
 
   // ---------- Stops & Targets ----------
   // Scalp multipliers (tight)
