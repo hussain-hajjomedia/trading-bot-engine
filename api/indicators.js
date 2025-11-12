@@ -354,6 +354,70 @@ export default async function handler(req, res) {
     else if (sellWeight > buyWeight && sellWeight >= 4.0) final_signal = 'SELL';
     else final_signal = 'HOLD';
 
+        // ---------- DEBUG LOGGING & optional flip-zone override ----------
+    try {
+      // Helpful logs to diagnose why final_signal is HOLD
+      console.log('[indicators][debug] tfResults summary:',
+        {
+          '15m_score': tfResults['15m']?.score,
+          '1h_score': tfResults['1h']?.score,
+          '4h_score': tfResults['4h']?.score,
+          '1d_score': tfResults['1d']?.score,
+          'final_signal_before': final_signal
+        }
+      );
+      console.log('[indicators][debug] last closes:',
+        {
+          '15m': tfResults['15m']?.last?.close,
+          '1h': tfResults['1h']?.last?.close,
+          '4h': tfResults['4h']?.last?.close,
+          '1d': tfResults['1d']?.last?.close
+        }
+      );
+      console.log('[indicators][debug] flip zone:',
+        { flip_zone_price, flip_zone_confidence }
+      );
+    } catch (e) {
+      console.log('[indicators][debug] logging error', e);
+    }
+    
+    // OPTIONAL: Flip-zone override rules
+    // Configure these thresholds as you prefer:
+    const OVERRIDE_CONFIDENCE = 0.60;    // require >= 0.6 confidence
+    const OVERRIDE_MULTI_TF_COUNT = 2;   // require at least 2 higher TFs (1h/4h/1d) aligned with the flip direction
+    // Determine current mid price to compare to flip zone
+    const currentPrice = tfResults['1h']?.last?.close ?? tfResults['15m']?.last?.close ?? null;
+    
+    if (typeof flip_zone_price !== 'undefined' && flip_zone_price != null && typeof flip_zone_confidence !== 'undefined') {
+      // determine direction: if currentPrice < flip_zone_price => likely trending DOWN through flip zone
+      const dirFromFlip = currentPrice != null && currentPrice < flip_zone_price ? 'DOWN' : (currentPrice != null && currentPrice > flip_zone_price ? 'UP' : null);
+    
+      if (dirFromFlip && flip_zone_confidence >= OVERRIDE_CONFIDENCE && currentPrice != null) {
+        // count higher-tf alignment (1h, 4h, 1d)
+        let alignCount = 0;
+        const checkTfAlign = (tf) => {
+          const s = tfResults[tf]?.signal || 'HOLD';
+          if (dirFromFlip === 'DOWN' && (s.includes('SELL') || s.includes('STRONG SELL'))) return 1;
+          if (dirFromFlip === 'UP' && (s.includes('BUY') || s.includes('STRONG BUY'))) return 1;
+          return 0;
+        };
+        alignCount += checkTfAlign('1h');
+        alignCount += checkTfAlign('4h');
+        alignCount += checkTfAlign('1d');
+    
+        console.log('[indicators][debug] flip override candidate', { dirFromFlip, flip_zone_confidence, alignCount });
+    
+        if (alignCount >= OVERRIDE_MULTI_TF_COUNT) {
+          // Overwrite final_signal conservatively
+          if (dirFromFlip === 'DOWN') final_signal = 'STRONG SELL';
+          else if (dirFromFlip === 'UP') final_signal = 'STRONG BUY';
+          console.log('[indicators][debug] final_signal OVERRIDDEN to', final_signal);
+        } else {
+          console.log('[indicators][debug] override conditions not met (alignCount < threshold)');
+        }
+      }
+    }
+    
     console.log('[swing] voting:', { buyWeight, sellWeight, final_signal });
 
     // ---------- Multi-TF ATR normalization ----------
