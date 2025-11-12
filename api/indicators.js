@@ -354,6 +354,10 @@ export default async function handler(req, res) {
     else if (sellWeight > buyWeight && sellWeight >= 4.0) final_signal = 'SELL';
     else final_signal = 'HOLD';
 
+    // Predefine flip-zone variables before debugging
+    let flip_zone_price = null;
+    let flip_zone_confidence = 0;
+
         // ---------- DEBUG LOGGING & optional flip-zone override ----------
     try {
       // Helpful logs to diagnose why final_signal is HOLD
