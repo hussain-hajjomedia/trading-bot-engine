@@ -357,6 +357,7 @@ module.exports = async function handler(req, res) {
     // Predefine flip-zone variables before debugging
     let flip_zone_price = null;
     let flip_zone_confidence = 0;
+    let flip_zone_description = null;
 
         // ---------- DEBUG LOGGING & optional flip-zone override ----------
     try {
@@ -500,9 +501,9 @@ module.exports = async function handler(req, res) {
     // If direction is UP, flip zone = extension area beyond high (ext1382/1618) OR retracement zone 0.5-0.618 for pullback entries.
     // We'll compute distances from current price to these levels and produce confidence.
     currentPrice = fallbackPrice;
-    let flip_zone_confidence = 0;
-    let flip_zone_description = null;
-    let flip_zone_price = null;
+    flip_zone_confidence = 0;
+    flip_zone_description = null;
+    flip_zone_price = null;
     if (fib && currentPrice != null) {
       // closeness scoring: nearer levels => higher confidence that flip could happen there
       function closenessScore(level) {
