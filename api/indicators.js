@@ -494,10 +494,7 @@ export default async function handler(req, res) {
         flip_zone_confidence = Math.max(0, Math.min(1, best.combined));
       
         // Compute the midpoint of the flip zone (exact price)
-        const flipMid = (best.low != null && best.high != null)
-          ? (best.low + best.high) / 2
-          : (best.low ?? best.high ?? null);
-      
+        const flipMid = (best.low + best.high) / 2
         flip_zone_price = flipMid;
         flip_zone_description = `${best.name} (${flipMid ? flipMid.toFixed(2) : 'n/a'})`;
       }
