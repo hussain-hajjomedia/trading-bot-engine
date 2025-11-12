@@ -434,6 +434,7 @@ export default async function handler(req, res) {
     const currentPrice = fallbackPrice;
     let flip_zone_confidence = 0;
     let flip_zone_description = null;
+    let flip_zone_price = null;
     if (fib && currentPrice != null) {
       // closeness scoring: nearer levels => higher confidence that flip could happen there
       function closenessScore(level) {
