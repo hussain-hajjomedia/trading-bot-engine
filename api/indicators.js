@@ -492,7 +492,14 @@ export default async function handler(req, res) {
       if (candidates.length) {
         const best = candidates[0];
         flip_zone_confidence = Math.max(0, Math.min(1, best.combined));
-        flip_zone_description = `${best.name} (${(best.low || best.high) || 'n/a'})`;
+      
+        // Compute the midpoint of the flip zone (exact price)
+        const flipMid = (best.low != null && best.high != null)
+          ? (best.low + best.high) / 2
+          : (best.low ?? best.high ?? null);
+      
+        flip_zone_price = flipMid;
+        flip_zone_description = `${best.name} (${flipMid ? flipMid.toFixed(2) : 'n/a'})`;
       }
     }
 
@@ -632,7 +639,11 @@ export default async function handler(req, res) {
       else reasons.push({ timeframe: tf, score: r.score, reasons: [] });
     }
     // add flip zone object for downstream processing (sheet, LLM)
-    reasons.push({ flip_zone_confidence: flip_zone_confidence, flip_zone_description });
+    reasons.push({
+      flip_zone_confidence: flip_zone_confidence,
+      flip_zone_price: flip_zone_price,
+      flip_zone_description
+    });
 
     const output = {
       symbol: symbol || null,
