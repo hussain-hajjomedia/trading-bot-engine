@@ -390,7 +390,7 @@ module.exports = async function handler(req, res) {
     const OVERRIDE_CONFIDENCE = 0.60;    // require >= 0.6 confidence
     const OVERRIDE_MULTI_TF_COUNT = 2;   // require at least 2 higher TFs (1h/4h/1d) aligned with the flip direction
     // Determine current mid price to compare to flip zone
-    const currentPrice = tfResults['1h']?.last?.close ?? tfResults['15m']?.last?.close ?? null;
+    let currentPrice = tfResults['1h']?.last?.close ?? tfResults['15m']?.last?.close ?? null;
     
     if (typeof flip_zone_price !== 'undefined' && flip_zone_price != null && typeof flip_zone_confidence !== 'undefined') {
       // determine direction: if currentPrice < flip_zone_price => likely trending DOWN through flip zone
@@ -499,7 +499,7 @@ module.exports = async function handler(req, res) {
     // determine flip-zone candidates:
     // If direction is UP, flip zone = extension area beyond high (ext1382/1618) OR retracement zone 0.5-0.618 for pullback entries.
     // We'll compute distances from current price to these levels and produce confidence.
-    const currentPrice = fallbackPrice;
+    currentPrice = fallbackPrice;
     let flip_zone_confidence = 0;
     let flip_zone_description = null;
     let flip_zone_price = null;
