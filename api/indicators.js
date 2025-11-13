@@ -1,5 +1,5 @@
 // api/indicators-swing.js
-// Full swing indicator engine — updated with corrected flip-zone logic
+// Full swing indicator engine — corrected impulse/fib flip-zone bug
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
@@ -65,7 +65,7 @@ export default async function handler(req, res) {
           openTime: safe(row[0]),
           open: safe(row[1]),
           high: safe(row[2]),
-          low: safe[row[3]],
+          low: safe(row[3]),
           close: safe(row[4]),
           volume: safe(row[5]),
           closeTime: safe(row[6]),
@@ -348,7 +348,7 @@ export default async function handler(req, res) {
       tfResults[tf] = analyzeTimeframe(tf, normalized[tf]);
     }
 
-        console.log('[swing] tfResults sample:', {
+    console.log('[swing] tfResults sample:', {
       '1d_score': tfResults['1d']?.score, '4h_score': tfResults['4h']?.score,
       '1h_score': tfResults['1h']?.score
     });
@@ -374,7 +374,7 @@ export default async function handler(req, res) {
     else if (sellWeight > buyWeight && sellWeight >= 4.0) final_signal = 'SELL';
     else final_signal = 'HOLD';
 
-    // ---------- Flip-zone logic (fully rewritten) ----------
+    // ---------- Flip-zone logic (fixed impulse pairing & fib guards) ----------
     const fallbackPrice =
       tfResults['4h']?.last?.close ??
       tfResults['1h']?.last?.close ??
@@ -398,51 +398,80 @@ export default async function handler(req, res) {
     const swings1h = findSwingPoints(normalized['1h'], 3);
     const swings15 = findSwingPoints(normalized['15m'], 3);
 
+    // Fixed: pick the most recent meaningful high/low pair (adjacent in time)
     function lastImpulseFromSwings(sw) {
       if (!sw) return null;
-      const highs = sw.swingHighs;
-      const lows = sw.swingLows;
-      if (!highs.length || !lows.length) return null;
+      const highs = Array.isArray(sw.swingHighs) ? sw.swingHighs : [];
+      const lows = Array.isArray(sw.swingLows) ? sw.swingLows : [];
+      if (highs.length === 0 && lows.length === 0) return null;
+
+      const combined = [];
+      highs.forEach(h => combined.push({ type: 'H', index: h.index, price: h.price }));
+      lows.forEach(l => combined.push({ type: 'L', index: l.index, price: l.price }));
+      combined.sort((a, b) => a.index - b.index);
+
+      // iterate from the end looking for the most recent adjacent HL or LH pair
+      for (let i = combined.length - 2; i >= 0; i--) {
+        const a = combined[i], b = combined[i + 1];
+        if (!a || !b) continue;
+        if (a.type === 'L' && b.type === 'H') {
+          // ensure we have finite numbers and order them correctly
+          const low = Number.isFinite(a.price) ? a.price : null;
+          const high = Number.isFinite(b.price) ? b.price : null;
+          if (low != null && high != null) return { dir: 'UP', low: Math.min(low, high), high: Math.max(low, high) };
+        }
+        if (a.type === 'H' && b.type === 'L') {
+          const high = Number.isFinite(a.price) ? a.price : null;
+          const low = Number.isFinite(b.price) ? b.price : null;
+          if (low != null && high != null) return { dir: 'DOWN', low: Math.min(low, high), high: Math.max(low, high) };
+        }
+      }
+
+      // fallback: if we still have highs/lows, pick last values but normalize them
       const lastHigh = highs[highs.length - 1];
       const lastLow = lows[lows.length - 1];
-      if (lastLow.index < lastHigh.index) return { dir: 'UP', low: lastLow.price, high: lastHigh.price };
-      if (lastHigh.index < lastLow.index) return { dir: 'DOWN', high: lastHigh.price, low: lastLow.price };
+      if (lastHigh && lastLow && Number.isFinite(lastHigh.price) && Number.isFinite(lastLow.price)) {
+        // infer direction from indices if possible
+        if (lastLow.index < lastHigh.index) return { dir: 'UP', low: Math.min(lastLow.price, lastHigh.price), high: Math.max(lastLow.price, lastHigh.price) };
+        if (lastHigh.index < lastLow.index) return { dir: 'DOWN', low: Math.min(lastLow.price, lastHigh.price), high: Math.max(lastLow.price, lastHigh.price) };
+      }
+
       return null;
     }
 
     const imp4 = lastImpulseFromSwings(swings4h);
     const imp1 = lastImpulseFromSwings(swings1h);
     const imp15 = lastImpulseFromSwings(swings15);
-    let impulse = imp4 || imp1 || imp15;
 
+    // prefer 4h then 1h then 15m (existing behavior)
+    let impulse = imp4 || imp1 || imp15;
     if (imp4 && imp1) {
       const size4 = Math.abs(imp4.high - imp4.low);
       const size1 = Math.abs(imp1.high - imp1.low);
       impulse = (size4 >= size1 * 0.8) ? imp4 : imp1;
     }
 
+    // compute fib extension/projection for that impulse (guarded)
     function computeFibForImpulse(imp) {
       if (!imp || imp.low == null || imp.high == null) return null;
-      const high = imp.high, low = imp.low;
+      // normalize low/high to ensure leg is positive
+      const low = Math.min(imp.low, imp.high);
+      const high = Math.max(imp.low, imp.high);
+      const leg = high - low;
+      if (!isFinite(leg) || leg === 0) return null;
 
       if (imp.dir === 'UP') {
-        return {
-          dir: 'UP',
-          retr50: low + 0.5 * (high - low),
-          retr618: low + 0.618 * (high - low),
-          ext1382: low + 1.382 * (high - low),
-          ext1618: low + 1.618 * (high - low),
-          high, low
-        };
+        const ext1382 = low + 1.382 * leg;
+        const ext1618 = low + 1.618 * leg;
+        const retr50 = low + 0.5 * leg;
+        const retr618 = low + 0.618 * leg;
+        return { dir: 'UP', retr50, retr618, ext1382, ext1618, low, high };
       } else {
-        return {
-          dir: 'DOWN',
-          retr50: high - 0.5 * (high - low),
-          retr618: high - 0.618 * (high - low),
-          ext1382: high - 1.382 * (high - low),
-          ext1618: high - 1.618 * (high - low),
-          high, low
-        };
+        const ext1382 = high - 1.382 * leg;
+        const ext1618 = high - 1.618 * leg;
+        const retr50 = high - 0.5 * leg;
+        const retr618 = high - 0.618 * leg;
+        return { dir: 'DOWN', retr50, retr618, ext1382, ext1618, low, high };
       }
     }
 
@@ -520,17 +549,18 @@ export default async function handler(req, res) {
       const VISIBILITY_THRESHOLD = 0.25;
 
       candidates.forEach(c => {
-        const center = (c.low + c.high) / 2;
-        const distPct = Math.abs((center - currentPrice) / Math.max(1, currentPrice));
+        const low = Number.isFinite(c.low) ? c.low : null;
+        const high = Number.isFinite(c.high) ? c.high : null;
+        if (low == null || high == null) { c.combined = -1; return; }
 
-        if (!Number.isFinite(center) || distPct > MAX_ACCEPT_PCT) {
-          c.combined = -1;
-          return;
-        }
+        const center = (low + high) / 2;
+        if (!Number.isFinite(center)) { c.combined = -1; return; }
+
+        const distPct = Math.abs((center - currentPrice) / Math.max(1, currentPrice));
+        if (distPct > MAX_ACCEPT_PCT) { c.combined = -1; return; }
 
         const structScore = structureAlignScore(center);
-        const dirPenalty =
-          (marketTrend && fib.dir && marketTrend !== fib.dir) ? 0.25 : 1.0;
+        const dirPenalty = (marketTrend && fib.dir && marketTrend !== fib.dir) ? 0.25 : 1.0;
 
         c.combined =
           (c.score * 0.6 +
@@ -545,8 +575,12 @@ export default async function handler(req, res) {
 
       if (best) {
         flip_zone_confidence = Math.max(0, Math.min(1, best.combined));
-        flip_zone_price = (best.low + best.high) / 2;
-        flip_zone_description = `${best.name} (${flip_zone_price.toFixed(2)})`;
+        const bLow = Number.isFinite(best.low) ? best.low : null;
+        const bHigh = Number.isFinite(best.high) ? best.high : null;
+        if (bLow != null && bHigh != null) {
+          flip_zone_price = (bLow + bHigh) / 2;
+          flip_zone_description = `${best.name} (${flip_zone_price.toFixed(2)})`;
+        }
       }
     }
 
