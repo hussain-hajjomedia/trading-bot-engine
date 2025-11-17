@@ -9,7 +9,8 @@ export default async function handler(req, res) {
 
   try {
     const payload = req.body || {};
-    let { symbol, exchangeSymbol, kline_15m, kline_1h, kline_4h, kline_1d, tickSize, priceTickSize, stepSize } = payload;
+    let { symbol, exchangeSymbol, kline_15m, kline_1h, kline_4h, kline_1d, tickSize, priceTickSize, stepSize, strictNulls } = payload;
+    strictNulls = (strictNulls === false) ? false : true;
 
     console.log('[indicators] start', { symbol, exchangeSymbol });
 
@@ -652,7 +653,10 @@ export default async function handler(req, res) {
 
     function bandsForLevels() {
       // Prefer confluence hot zone center as anchor; fallback to fib pullback zone; else EMA/ST band
-      const best = (Array.isArray(scoredWithFvg) && scoredWithFvg.length) ? scoredWithFvg[0] : null;
+      const ZONE_MIN_SCORE = 0.55;
+      const best = (Array.isArray(scoredWithFvg) && scoredWithFvg.length)
+        ? (scoredWithFvg.find(z => (z.score ?? 0) >= ZONE_MIN_SCORE) || null)
+        : null;
       if (best) {
         const mid = (best.low + best.high) / 2;
         const half1 = Math.max(atrRef * 0.12, (best.high - best.low) * 0.5);
@@ -664,7 +668,10 @@ export default async function handler(req, res) {
           level3: { low: mid - half3, high: mid + half3 },
         };
       }
-      // Fib fallback
+      if (strictNulls) {
+        return null;
+      }
+      // Fib fallback (non-strict)
       if (fib && fibModeActive && fib.pullLow != null && fib.pullHigh != null) {
         const mid = (fib.pullLow + fib.pullHigh) / 2;
         const half1 = Math.max(atrRef * 0.12, (Math.abs(fib.pullHigh - fib.pullLow)) * 0.5);
@@ -676,7 +683,7 @@ export default async function handler(req, res) {
           level3: { low: mid - half3, high: mid + half3 },
         };
       }
-      // EMA/ST fallback (coherent, no arbitrary clamp)
+      // EMA/ST fallback (coherent, no arbitrary clamp) for non-strict mode
       const p = basePrice;
       let rawLow, rawHigh;
       if (trend === 'UP') {
@@ -846,9 +853,13 @@ export default async function handler(req, res) {
       if (dir === 'DOWN') return (ema9 < ema21) && (macd < macdSig);
       return false;
     }
-    const bestZone = (Array.isArray(scoredWithFvg) && scoredWithFvg.length) ? scoredWithFvg[0] : null;
-    const zoneMid = bestZone ? (bestZone.low + bestZone.high)/2 : null;
+    // Build a primary zone
     const lastPrice = lastClose15 ?? tfResults['15m']?.last?.close ?? null;
+    const ZONE_MIN_SCORE = 0.55;
+    let bestZone = (Array.isArray(scoredWithFvg) && scoredWithFvg.length)
+      ? (scoredWithFvg.find(z => (z.score ?? 0) >= ZONE_MIN_SCORE) || null)
+      : null;
+    const zoneMid = bestZone ? ((bestZone.low + bestZone.high)/2) : null;
     const pad = Number.isFinite(atrRef) ? atrRef * 0.15 : ((lastPrice ?? 0) * 0.0005);
     const inZone = (bestZone && lastPrice != null)
       ? (lastPrice >= (bestZone.low - pad) && lastPrice <= (bestZone.high + pad))
@@ -857,9 +868,9 @@ export default async function handler(req, res) {
     const confirm = dirMap ? ltfConfirm(dirMap) : false;
     // Confidences
     function clamp01(x){ return Math.max(0, Math.min(1, x)); }
-    const dist = (bestZone && lastPrice != null) ? Math.abs(((bestZone.low+bestZone.high)/2) - lastPrice) : null;
+    const dist = (bestZone && lastPrice != null) ? Math.abs(zoneMid - lastPrice) : null;
     const prox = dist == null ? 0 : Math.exp(- (dist*dist) / (2 * Math.pow((atrRef ?? (lastPrice*0.003)) * 0.6, 2)));
-    const entry_confidence = clamp01(0.6 * prox + 0.25 * (bestZone?.score ?? 0) + 0.15 * (confirm ? 1 : 0));
+    const entry_confidence = bestZone ? clamp01(0.6 * prox + 0.25 * (bestZone.score ?? 0) + 0.15 * (confirm ? 1 : 0)) : 0;
     const signal_confidence = clamp01(Math.abs((tfResults['1h']?.score ?? 0)) / 40);
     const ready = (signal_confidence >= 0.6) && (entry_confidence >= 0.6) && confirm && inZone;
 
@@ -873,12 +884,12 @@ export default async function handler(req, res) {
       bias: final_signal.includes('BUY') ? 'BUY' : (final_signal.includes('SELL') ? 'SELL' : 'HOLD'),
       bias_confidence: Number(signal_confidence.toFixed(3)),
       entry_confidence: Number(entry_confidence.toFixed(3)),
-      position_size_factor: Number((Math.max(0, Math.min(1, (bestZone?.score ?? 0)*0.6 + (confirm?0.2:0) + (prox*0.2)))).toFixed(3)),
-      position_size_tier: (bestZone?.score ?? 0) >= 0.7 ? 'large' : ((bestZone?.score ?? 0) >= 0.4 ? 'normal' : 'small'),
+      position_size_factor: bestZone ? Number((Math.max(0, Math.min(1, (bestZone.score ?? 0)*0.6 + (confirm?0.2:0) + (prox*0.2)))).toFixed(3)) : null,
+      position_size_tier: bestZone ? ((bestZone.score ?? 0) >= 0.7 ? 'large' : ((bestZone.score ?? 0) >= 0.4 ? 'normal' : 'small')) : null,
       primary_zone: bestZone ? {
         range_low: bestZone.low,
         range_high: bestZone.high,
-        mid: (bestZone.low + bestZone.high)/2,
+        mid: zoneMid,
         includes_0714: !!bestZone.includes0714,
         includes_extension: !!bestZone.includesExt,
         fvg_overlap: !!bestZone.fvg_overlap,
@@ -886,12 +897,14 @@ export default async function handler(req, res) {
         action: final_signal.includes('BUY') ? 'LONG' : (final_signal.includes('SELL') ? 'SHORT' : null),
         ltf_ready: !!confirm
       } : null,
-      alt_zones: (scoredWithFvg || []).slice(1,3).map(z => ({
-        range_low: z.low, range_high: z.high, mid: (z.low+z.high)/2,
-        includes_0714: !!z.includes0714, includes_extension: !!z.includesExt,
-        fvg_overlap: !!z.fvg_overlap, score: Number((z.score ?? 0).toFixed(3))
-      })),
-      order_plan: {
+      alt_zones: (bestZone && Array.isArray(scoredWithFvg))
+        ? scoredWithFvg.filter(z => z !== bestZone && (z.score ?? 0) >= 0.55).slice(0,2).map(z => ({
+            range_low: z.low, range_high: z.high, mid: (z.low+z.high)/2,
+            includes_0714: !!z.includes0714, includes_extension: !!z.includesExt,
+            fvg_overlap: !!z.fvg_overlap, score: Number((z.score ?? 0).toFixed(3))
+          }))
+        : [],
+      order_plan: bestZone && bands && bands.level1 ? {
         side: final_signal.includes('BUY') ? 'LONG' : (final_signal.includes('SELL') ? 'SHORT' : 'FLAT'),
         entry_range: { low: suggestions.level1.entry_range.low, high: suggestions.level1.entry_range.high },
         entry: suggestions.level1.entry,
@@ -900,9 +913,15 @@ export default async function handler(req, res) {
         tp2: suggestions.level1.take_profit_2,
         atr_used: suggestions.level1.atr_used,
         ready
+      } : {
+        side: final_signal.includes('BUY') ? 'LONG' : (final_signal.includes('SELL') ? 'SHORT' : 'FLAT'),
+        entry_range: { low: null, high: null },
+        entry: null, stop: null, tp1: null, tp2: null,
+        atr_used: tfResults['15m']?.indicators?.atr14 ?? null,
+        ready: false
       },
       flip_zone: bestZone ? {
-        price: (bestZone.low + bestZone.high)/2,
+        price: zoneMid,
         description: bestZone.includes0714 ? 'includes 0.714 confluence' : (bestZone.includesExt ? 'includes extension confluence' : 'confluence zone'),
         action: final_signal.includes('BUY') ? 'LONG' : (final_signal.includes('SELL') ? 'SHORT' : null),
         direction_after: final_signal.includes('BUY') ? 'BUY' : (final_signal.includes('SELL') ? 'SELL' : null),
