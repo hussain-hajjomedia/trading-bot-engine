@@ -9,7 +9,7 @@ export default async function handler(req, res) {
 
   try {
     const payload = req.body || {};
-    let { symbol, exchangeSymbol, kline_15m, kline_1h, kline_4h, kline_1d } = payload;
+    let { symbol, exchangeSymbol, kline_15m, kline_1h, kline_4h, kline_1d, tickSize, priceTickSize, stepSize } = payload;
 
     console.log('[indicators] start', { symbol, exchangeSymbol });
 
@@ -123,6 +123,39 @@ export default async function handler(req, res) {
       '1d': normalized['1d'].length,
     });
 
+    // Ensure ascending sort by openTime, dedupe by openTime, drop incomplete last bar if closeTime is in the future
+    function finalizeCandles(rawArr) {
+      if (!Array.isArray(rawArr)) return [];
+      const arr = rawArr
+        .filter(c => c && c.openTime != null && Number.isFinite(Number(c.openTime)));
+      arr.sort((a, b) => Number(a.openTime) - Number(b.openTime));
+      const out = [];
+      const seen = new Set();
+      for (let i = 0; i < arr.length; i++) {
+        const ot = Number(arr[i].openTime);
+        if (seen.has(ot)) continue;
+        seen.add(ot);
+        out.push(arr[i]);
+      }
+      if (out.length) {
+        const last = out[out.length - 1];
+        const ct = last && last.closeTime != null ? Number(last.closeTime) : null;
+        if (ct != null && Number.isFinite(ct) && ct > Date.now()) out.pop();
+      }
+      return out;
+    }
+    normalized['15m'] = finalizeCandles(normalized['15m']);
+    normalized['1h']  = finalizeCandles(normalized['1h']);
+    normalized['4h']  = finalizeCandles(normalized['4h']);
+    normalized['1d']  = finalizeCandles(normalized['1d']);
+
+    console.log('[indicators] finalized lengths', {
+      '15m': normalized['15m'].length,
+      '1h': normalized['1h'].length,
+      '4h': normalized['4h'].length,
+      '1d': normalized['1d'].length,
+    });
+
     // ---------- Indicator helpers ----------
     const toNum = (v) => (v == null ? null : Number(v));
 
@@ -213,22 +246,37 @@ export default async function handler(req, res) {
       return out;
     }
 
-    function superTrend(highs, lows, closes, period = 10, mult = 3) {
+    function superTrendCanonical(highs, lows, closes, period = 10, mult = 3) {
+      const len = closes.length;
       const atrArr = atr(highs, lows, closes, period);
       const hl2 = highs.map((h, i) => (h + lows[i]) / 2);
-      const upper = hl2.map((v, i) => v + mult * (atrArr[i] == null ? 0 : atrArr[i]));
-      const lower = hl2.map((v, i) => v - mult * (atrArr[i] == null ? 0 : atrArr[i]));
-      const finalUpper = new Array(closes.length).fill(null);
-      const finalLower = new Array(closes.length).fill(null);
-      const st = new Array(closes.length).fill(null);
-      for (let i = 0; i < closes.length; i++) {
-        if (i === 0) { finalUpper[i] = upper[i]; finalLower[i] = lower[i]; continue; }
-        finalUpper[i] = Math.min(upper[i] == null ? Infinity : upper[i], finalUpper[i - 1] == null ? Infinity : finalUpper[i - 1]);
-        finalLower[i] = Math.max(lower[i] == null ? -Infinity : lower[i], finalLower[i - 1] == null ? -Infinity : finalLower[i - 1]);
-        if (finalLower[i] == null || finalUpper[i] == null) st[i] = null;
-        else st[i] = closes[i] > finalLower[i] ? finalLower[i] : finalUpper[i];
+      const upperBasic = hl2.map((v, i) => v + mult * (atrArr[i] == null ? 0 : atrArr[i]));
+      const lowerBasic = hl2.map((v, i) => v - mult * (atrArr[i] == null ? 0 : atrArr[i]));
+      const finalUpper = new Array(len).fill(null);
+      const finalLower = new Array(len).fill(null);
+      const st = new Array(len).fill(null);
+      const trend = new Array(len).fill(null);
+      for (let i = 0; i < len; i++) {
+        if (i === 0) {
+          finalUpper[i] = upperBasic[i];
+          finalLower[i] = lowerBasic[i];
+          st[i] = null; trend[i] = null;
+          continue;
+        }
+        finalUpper[i] = (upperBasic[i] < (finalUpper[i - 1] ?? Infinity) || closes[i - 1] > (finalUpper[i - 1] ?? Infinity))
+          ? upperBasic[i] : finalUpper[i - 1];
+        finalLower[i] = (lowerBasic[i] > (finalLower[i - 1] ?? -Infinity) || closes[i - 1] < (finalLower[i - 1] ?? -Infinity))
+          ? lowerBasic[i] : finalLower[i - 1];
+        if (st[i - 1] == null) {
+          st[i] = closes[i] >= finalLower[i] ? finalLower[i] : finalUpper[i];
+        } else if (st[i - 1] === finalUpper[i - 1]) {
+          st[i] = closes[i] <= finalUpper[i] ? finalUpper[i] : finalLower[i];
+        } else {
+          st[i] = closes[i] >= finalLower[i] ? finalLower[i] : finalUpper[i];
+        }
+        trend[i] = (st[i] === finalLower[i]) ? 1 : -1;
       }
-      return st;
+      return { st, trend };
     }
 
     // ---------- Micro-structure (swing points) ----------
@@ -278,7 +326,9 @@ export default async function handler(req, res) {
       const rsi14    = rsiWilder(closes, 14);
       const macdObj  = macd(closes);
       const atr7Arr  = atr(highs, lows, closes, 7);
-      const stArr    = superTrend(highs, lows, closes, 10, 3);
+      const atr14Arr = atr(highs, lows, closes, 14);
+      const stObj    = superTrendCanonical(highs, lows, closes, 10, 3);
+      const stArr    = stObj.st;
 
       const i = closes.length - 1;
       const last = { close: closes[i], high: highs[i], low: lows[i], volume: volumes[i], time: candles[i].openTime };
@@ -290,6 +340,7 @@ export default async function handler(req, res) {
         rsi14: rsi14[i],
         macd: macdObj.macdLine[i], macd_signal: macdObj.signalLine[i], macd_hist: macdObj.hist[i],
         atr7: atr7Arr[i],
+        atr14: atr14Arr[i],
         supertrend: stArr[i],
         volume: volumes[i],
       };
@@ -339,30 +390,44 @@ export default async function handler(req, res) {
     else if (sellWeight > buyWeight && sellWeight >= 3.0) final_signal = 'SELL';
     else final_signal = 'HOLD';
 
-    // ---------- ATR reference (multi-TF average between 15m & 1h) ----------
-    function atrCombined() {
-      const a15 = tfResults['15m']?.indicators?.atr7 ?? null;
-      const a1h = tfResults['1h']?.indicators?.atr7 ?? null;
-      if (a15 != null && a1h != null) return (a15 * 0.6 + a1h * 0.4);
-      if (a15 != null) return a15;
-      if (a1h != null) return a1h;
-      return null;
-    }
-
+    // ---------- ATR reference (15m only) ----------
     const lastClose15 = tfResults['15m']?.last?.close ?? null;
-    const lastClose1h = tfResults['1h']?.last?.close ?? null;
-    const atrRef = (() => {
-      const a = atrCombined();
-      if (a != null) return a;
-      const ref = lastClose15 ?? lastClose1h ?? null;
-      return ref != null ? ref * 0.003 : 1;
-    })();
+    const atrRef = tfResults['15m']?.indicators?.atr14 ?? tfResults['15m']?.indicators?.atr7 ?? (lastClose15 != null ? lastClose15 * 0.003 : 1);
 
     console.log('[indicators] atrRef', atrRef);
 
     // ---------- Conditional Fibonacci (pullback-only) ----------
     const swings15 = findSwingPoints(normalized['15m']);
     const swings1h = findSwingPoints(normalized['1h']);
+
+    // Detect BOS on 15m and derive the impulse that caused it
+    function detectBosFromSwings(candles, swings) {
+      if (!candles || !candles.length || !swings) return null;
+      const closes = candles.map(c => toNum(c.close));
+      const lastClose = closes[closes.length - 1];
+      const sh = (swings.swingHighs || []).map(x => x.index).sort((a,b)=>a-b);
+      const sl = (swings.swingLows  || []).map(x => x.index).sort((a,b)=>a-b);
+      if (!sh.length || !sl.length) return null;
+      const lastHighIdx = sh[sh.length - 1];
+      const lastLowIdx  = sl[sl.length - 1];
+      const lastHighVal = toNum(candles[lastHighIdx]?.high);
+      const lastLowVal  = toNum(candles[lastLowIdx]?.low);
+      let dir = null;
+      if (Number.isFinite(lastHighVal) && lastClose > lastHighVal) dir = 'UP';
+      else if (Number.isFinite(lastLowVal) && lastClose < lastLowVal) dir = 'DOWN';
+      if (!dir) return null;
+      if (dir === 'UP') {
+        const startIdx = lastLowIdx, endIdx = lastHighIdx;
+        const low = toNum(candles[startIdx]?.low), high = toNum(candles[endIdx]?.high);
+        if (Number.isFinite(low) && Number.isFinite(high)) return { dir, low, high, iLow: startIdx, iHigh: endIdx };
+      } else {
+        const startIdx = lastHighIdx, endIdx = lastLowIdx;
+        const high = toNum(candles[startIdx]?.high), low = toNum(candles[endIdx]?.low);
+        if (Number.isFinite(low) && Number.isFinite(high)) return { dir, high, low, iHigh: startIdx, iLow: endIdx };
+      }
+      return null;
+    }
+    const bos15 = detectBosFromSwings(normalized['15m'], swings15);
 
     function impulseFromSw(sw) {
       if (!sw) return null;
@@ -391,7 +456,8 @@ export default async function handler(req, res) {
       return (size1h > size15 * 1.5) ? imp1h : imp15;
     }
 
-    const impulse = pickImpulse();
+    let impulse = pickImpulse();
+    if (bos15 && bos15.low != null && bos15.high != null) impulse = bos15;
     console.log('[indicators] impulse', impulse);
 
     // Confirm impulse strength (leg >= 3x ATR or >= 0.35% of price)
@@ -441,6 +507,114 @@ export default async function handler(req, res) {
     const fib = fibModeActive ? fibPullbackAndTargets(impulse) : null;
     console.log('[indicators] fib', fib);
 
+    // ---------- Multi-impulse confluence (15m): golden pocket + 0.714 + 1.382/1.618 ----------
+    function buildImpulseList(sw) {
+      if (!sw || !sw.swingHighs || !sw.swingLows) return [];
+      const piv = [
+        ...sw.swingHighs.map(h => ({ t:'H', i:h.index, p:h.price })),
+        ...sw.swingLows.map(l => ({ t:'L', i:l.index, p:l.price })),
+      ].sort((a,b)=>a.i-b.i);
+      const legs = [];
+      for (let k = 1; k < piv.length; k++) {
+        const a = piv[k-1], b = piv[k];
+        if (a.t === b.t) continue;
+        if (a.t === 'L' && b.t === 'H') legs.push({ dir:'UP', low:a.p, high:b.p, iLow:a.i, iHigh:b.i });
+        if (a.t === 'H' && b.t === 'L') legs.push({ dir:'DOWN', high:a.p, low:b.p, iHigh:a.i, iLow:b.i });
+      }
+      return legs.slice(-6);
+    }
+    function fibsForLeg(leg) {
+      if (!leg || leg.low == null || leg.high == null) return null;
+      const low = leg.low, high = leg.high;
+      const gpLow = low < high ? (low + 0.618*(high-low)) : (high + 0.618*(low-high));
+      const gpHigh= low < high ? (low + 0.65 *(high-low)) : (high + 0.65 *(low-high));
+      const r0714 = low < high ? (low + 0.714*(high-low)) : (high + 0.714*(low-high));
+      const ext1382= low < high ? (low + 1.382*(high-low)) : (high - 1.382*(high-low));
+      const ext1618= low < high ? (low + 1.618*(high-low)) : (high - 1.618*(high-low));
+      return {
+        dir: leg.dir,
+        gp: { low: Math.min(gpLow,gpHigh), high: Math.max(gpLow,gpHigh) },
+        r0714,
+        ext1382, ext1618
+      };
+    }
+    const legs15 = buildImpulseList(swings15);
+    const fibsList = legs15.map(fibsForLeg).filter(Boolean);
+    function zonesFromFibs(f) {
+      return [
+        { label:'golden_pocket_0.618_0.65', type:'retr', low:f.gp.low, high:f.gp.high, dir:f.dir, includes0714:false },
+        { label:'retracement_0.714', type:'retr', low:f.r0714, high:f.r0714, dir:f.dir, includes0714:true },
+        { label:'extension_1.382', type:'ext', low:f.ext1382, high:f.ext1382, dir:f.dir, includes0714:false },
+        { label:'extension_1.618', type:'ext', low:f.ext1618, high:f.ext1618, dir:f.dir, includes0714:false }
+      ];
+    }
+    const allZones = fibsList.flatMap(zonesFromFibs).filter(z => Number.isFinite(z.low) && Number.isFinite(z.high));
+    function overlap(a,b) {
+      const lo = Math.max(Math.min(a.low,a.high), Math.min(b.low,b.high));
+      const hi = Math.min(Math.max(a.low,a.high), Math.max(b.low,b.high));
+      return lo <= hi ? { low:lo, high:hi } : null;
+    }
+    const hotZones = [];
+    for (let i=0;i<allZones.length;i++){
+      for (let j=i+1;j<allZones.length;j++){
+        const o = overlap(allZones[i], allZones[j]);
+        if (o) {
+          const includes0714 = allZones[i].includes0714 || allZones[j].includes0714;
+          const includesExt  = (allZones[i].type === 'ext' || allZones[j].type === 'ext');
+          hotZones.push({ low:o.low, high:o.high, includes0714, includesExt, labels:[allZones[i].label, allZones[j].label] });
+        }
+      }
+    }
+    function scoreHotZone(z) {
+      const a = Number.isFinite(atrRef) ? atrRef : (lastClose15 ?? 0) * 0.003;
+      const width = Math.max(1e-9, z.high - z.low);
+      const widthScore = Math.max(0, 1 - (width / (a*1.0)));
+      const highs = (swings15?.swingHighs || []).map(s=>Number(s.price)).filter(Number.isFinite);
+      const lows  = (swings15?.swingLows  || []).map(s=>Number(s.price)).filter(Number.isFinite);
+      const refList = highs.concat(lows);
+      const structScore = (() => {
+        if (!refList.length) return 0;
+        const mid = (z.low+z.high)/2;
+        const d = Math.min(...refList.map(p=>Math.abs(mid-p)));
+        const sigma = a * 1.0;
+        return Math.exp(-(d*d)/(2*sigma*sigma));
+      })();
+      const inc0714 = z.includes0714 ? 0.25 : 0;
+      const incExt  = z.includesExt  ? 0.15 : 0;
+      return Math.max(0, Math.min(1, 0.5*widthScore + 0.25*structScore + inc0714 + incExt));
+    }
+    const scoredHot = hotZones.map(z => ({ ...z, score: scoreHotZone(z) }))
+                              .sort((a,b)=>b.score-a.score)
+                              .slice(0,3);
+
+    // ---------- FVG detection (15m primary, 1h secondary) and boost ----------
+    function detectFVG(candles) {
+      const out = [];
+      for (let i = 1; i < candles.length - 1; i++) {
+        const prev = candles[i-1], cur = candles[i], next = candles[i+1];
+        if (!prev || !cur || !next) continue;
+        const prevHigh = toNum(prev.high), prevLow = toNum(prev.low);
+        const nextHigh = toNum(next.high), nextLow = toNum(next.low);
+        if (Number.isFinite(nextLow) && Number.isFinite(prevHigh) && nextLow > prevHigh) {
+          out.push({ type:'bull', low: prevHigh, high: nextLow, center:(prevHigh+nextLow)/2, index:i });
+        }
+        if (Number.isFinite(nextHigh) && Number.isFinite(prevLow) && nextHigh < prevLow) {
+          out.push({ type:'bear', low: nextHigh, high: prevLow, center:(nextHigh+prevLow)/2, index:i });
+        }
+      }
+      return out;
+    }
+    const fvg15 = detectFVG(normalized['15m']);
+    const fvg1h = detectFVG(normalized['1h']);
+    function zoneHasFvgOverlap(z) {
+      const has = (arr) => arr.some(g => !(z.high < g.low || z.low > g.high));
+      return has(fvg15) || has(fvg1h);
+    }
+    const scoredWithFvg = scoredHot.map(z => {
+      const fvg = zoneHasFvgOverlap(z);
+      const bonus = fvg ? 0.08 : 0;
+      return { ...z, score: Math.max(0, Math.min(1, z.score + bonus)), fvg_overlap: fvg };
+    }).sort((a,b)=>b.score-a.score);
     // ---------- Entry band (15m + 1h integration) ----------
     const ema15 = tfResults['15m']?.indicators?.ema9 ?? null;
     const ema1h = tfResults['1h']?.indicators?.ema9 ?? null;
@@ -477,38 +651,49 @@ export default async function handler(req, res) {
     const stBlend  = (st15 != null && st1h != null) ? (st15 * 0.5 + st1h * 0.5) : (st15 ?? st1h ?? basePrice);
 
     function bandsForLevels() {
-      const p = basePrice;
-      if (fib && fibModeActive && fib.pullLow != null && fib.pullHigh != null) {
-        // Pad the fib pullback zone by ATR fractions per level
-        const pad1 = atrRef * 0.10;
-        const pad2 = atrRef * 0.20;
-        const pad3 = atrRef * 0.35;
-        const baseLow  = fib.pullLow;
-        const baseHigh = fib.pullHigh;
+      // Prefer confluence hot zone center as anchor; fallback to fib pullback zone; else EMA/ST band
+      const best = (Array.isArray(scoredWithFvg) && scoredWithFvg.length) ? scoredWithFvg[0] : null;
+      if (best) {
+        const mid = (best.low + best.high) / 2;
+        const half1 = Math.max(atrRef * 0.12, (best.high - best.low) * 0.5);
+        const half2 = Math.max(atrRef * 0.20, half1 * 1.5);
+        const half3 = Math.max(atrRef * 0.30, half1 * 2.2);
         return {
-          level1: clampBandAround(p, baseLow  - pad1, baseHigh + pad1, 0.006, 0.0005),
-          level2: clampBandAround(p, baseLow  - pad2, baseHigh + pad2, 0.008, 0.0008),
-          level3: clampBandAround(p, baseLow  - pad3, baseHigh + pad3, 0.012, 0.0010),
-        };
-      } else {
-        // EMA/ST blended fallback (smoother entries)
-        let rawLow, rawHigh;
-        if (trend === 'UP') {
-          rawLow = Math.min(emaBlend, stBlend);
-          rawHigh = emaBlend;
-        } else if (trend === 'DOWN') {
-          rawLow = emaBlend;
-          rawHigh = Math.max(emaBlend, stBlend);
-        } else {
-          rawLow = p;
-          rawHigh = p;
-        }
-        return {
-          level1: clampBandAround(p, rawLow, rawHigh, 0.0045, 0.0006),
-          level2: clampBandAround(p, rawLow, rawHigh, 0.0065, 0.0009),
-          level3: clampBandAround(p, rawLow, rawHigh, 0.0105, 0.0011),
+          level1: { low: mid - half1, high: mid + half1 },
+          level2: { low: mid - half2, high: mid + half2 },
+          level3: { low: mid - half3, high: mid + half3 },
         };
       }
+      // Fib fallback
+      if (fib && fibModeActive && fib.pullLow != null && fib.pullHigh != null) {
+        const mid = (fib.pullLow + fib.pullHigh) / 2;
+        const half1 = Math.max(atrRef * 0.12, (Math.abs(fib.pullHigh - fib.pullLow)) * 0.5);
+        const half2 = Math.max(atrRef * 0.20, half1 * 1.5);
+        const half3 = Math.max(atrRef * 0.30, half1 * 2.2);
+        return {
+          level1: { low: mid - half1, high: mid + half1 },
+          level2: { low: mid - half2, high: mid + half2 },
+          level3: { low: mid - half3, high: mid + half3 },
+        };
+      }
+      // EMA/ST fallback (coherent, no arbitrary clamp)
+      const p = basePrice;
+      let rawLow, rawHigh;
+      if (trend === 'UP') {
+        rawLow = Math.min(emaBlend ?? p, stBlend ?? p);
+        rawHigh = emaBlend ?? p;
+      } else if (trend === 'DOWN') {
+        rawLow = emaBlend ?? p;
+        rawHigh = Math.max(emaBlend ?? p, stBlend ?? p);
+      } else {
+        rawLow = p; rawHigh = p;
+      }
+      const mid = (rawLow + rawHigh) / 2;
+      return {
+        level1: { low: mid - atrRef * 0.12, high: mid + atrRef * 0.12 },
+        level2: { low: mid - atrRef * 0.20, high: mid + atrRef * 0.20 },
+        level3: { low: mid - atrRef * 0.30, high: mid + atrRef * 0.30 },
+      };
     }
 
     const bands = bandsForLevels();
@@ -538,38 +723,54 @@ export default async function handler(req, res) {
 
       let sl, tp1, tp2;
 
-      if (fib && fibModeActive && fib.tp1 != null && fib.tp2 != null) {
-        // Use structure + fib extension for TPs where available
-        if (dir === 'UP') {
-          const structuralSL = (fib.swingStop != null) ? (fib.swingStop - a * 0.10) : (e - a * m);
-          sl  = Math.min(structuralSL, e - a * m);
-          tp1 = Number.isFinite(fib.tp1) ? fib.tp1 : (e + a * m * 1.0);
-          tp2 = Number.isFinite(fib.tp2) ? fib.tp2 : (e + a * m * 2.0);
-        } else if (dir === 'DOWN') {
-          const structuralSL = (fib.swingStop != null) ? (fib.swingStop + a * 0.10) : (e + a * m);
-          sl  = Math.max(structuralSL, e + a * m);
-          tp1 = Number.isFinite(fib.tp1) ? fib.tp1 : (e - a * m * 1.0);
-          tp2 = Number.isFinite(fib.tp2) ? fib.tp2 : (e - a * m * 2.0);
-        } else {
-          sl  = e - a * m;
-          tp1 = e + a * m * 0.8;
-          tp2 = e + a * m * 1.6;
-        }
+      // Structural SL based on 0.786 of impulse and nearest 15m swing
+      const calcRetr786 = () => {
+        if (!impulse || impulse.low == null || impulse.high == null) return null;
+        const low = impulse.low, high = impulse.high;
+        if (dir === 'UP') return low + 0.786 * (high - low);
+        if (dir === 'DOWN') return high - 0.786 * (high - low);
+        return null;
+      };
+      const retr786 = calcRetr786();
+      const nearestLow = (swings15 && Array.isArray(swings15.swingLows)) ? (() => {
+        const p = swings15.swingLows.map(s=>({price:s.price}));
+        return (function(price, swings){ if (!Array.isArray(swings) || swings.length===0) return null; const below = swings.filter(s=>s.price < price).map(s=>s.price); if (!below.length) return null; return Math.max(...below); })(e, swings15.swingLows);
+      })() : null;
+      const nearestHigh= (swings15 && Array.isArray(swings15.swingHighs)) ? (() => {
+        const p = swings15.swingHighs.map(s=>({price:s.price}));
+        return (function(price, swings){ if (!Array.isArray(swings) || swings.length===0) return null; const above = swings.filter(s=>s.price > price).map(s=>s.price); if (!above.length) return null; return Math.min(...above); })(e, swings15.swingHighs);
+      })() : null;
+
+      const ext1272 = (impulse && impulse.low != null && impulse.high != null)
+        ? (impulse.dir === 'UP' ? (impulse.low + 1.272*(impulse.high-impulse.low))
+                                : (impulse.high - 1.272*(impulse.high-impulse.low))) : null;
+      const ext1382 = (impulse && impulse.low != null && impulse.high != null)
+        ? (impulse.dir === 'UP' ? (impulse.low + 1.382*(impulse.high-impulse.low))
+                                : (impulse.high - 1.382*(impulse.high-impulse.low))) : null;
+      const ext1618 = (impulse && impulse.low != null && impulse.high != null)
+        ? (impulse.dir === 'UP' ? (impulse.low + 1.618*(impulse.high-impulse.low))
+                                : (impulse.high - 1.618*(impulse.high-impulse.low))) : null;
+
+      if (dir === 'UP') {
+        const candidates = [];
+        if (Number.isFinite(retr786)) candidates.push(retr786 - a * 0.05);
+        if (Number.isFinite(nearestLow)) candidates.push(nearestLow - a * 0.05);
+        candidates.push(e - a * m);
+        sl = Math.min(...candidates.filter(Number.isFinite));
+        tp1 = Number.isFinite(ext1272) ? ext1272 : (e + a * m * 1.0);
+        tp2 = Number.isFinite(ext1618) ? ext1618 : (e + a * m * 2.0);
+      } else if (dir === 'DOWN') {
+        const candidates = [];
+        if (Number.isFinite(retr786)) candidates.push(retr786 + a * 0.05);
+        if (Number.isFinite(nearestHigh)) candidates.push(nearestHigh + a * 0.05);
+        candidates.push(e + a * m);
+        sl = Math.max(...candidates.filter(Number.isFinite));
+        tp1 = Number.isFinite(ext1272) ? ext1272 : (e - a * m * 1.0);
+        tp2 = Number.isFinite(ext1618) ? ext1618 : (e - a * m * 2.0);
       } else {
-        // Non-fib fallback
-        if (dir === 'UP') {
-          sl  = e - a * m;
-          tp1 = e + a * m * 1.0;
-          tp2 = e + a * m * 2.0;
-        } else if (dir === 'DOWN') {
-          sl  = e + a * m;
-          tp1 = e - a * m * 1.0;
-          tp2 = e - a * m * 2.0;
-        } else {
-          sl  = e - a * m;
-          tp1 = e + a * m * 0.8;
-          tp2 = e + a * m * 1.6;
-        }
+        sl  = e - a * m;
+        tp1 = e + a * m * 0.8;
+        tp2 = e + a * m * 1.6;
       }
 
       // Safety caps (scalp): 2% from entry, TP2 up to 3%
@@ -580,16 +781,50 @@ export default async function handler(req, res) {
       return { sl, tp1, tp2 };
     }
 
-    // Assemble suggestions
+    // Assemble suggestions (distinct entries per level) with quantization
+    function inferTickSize(tfName) {
+      const arr = normalized[tfName] || [];
+      const vals = [];
+      const push = (v) => { const n = Number(v); if (Number.isFinite(n)) vals.push(n); };
+      for (let i = Math.max(0, arr.length - 200); i < arr.length; i++) {
+        const c = arr[i];
+        push(c.close); push(c.open); push(c.high); push(c.low);
+      }
+      if (vals.length < 2) return 0.01;
+      vals.sort((a,b)=>a-b);
+      let minStep = Infinity;
+      for (let i = 1; i < vals.length; i++) {
+        const d = Math.abs(vals[i] - vals[i-1]);
+        if (d > 0) minStep = Math.min(minStep, d);
+      }
+      if (!Number.isFinite(minStep) || minStep === 0) return 0.01;
+      const exp = Math.ceil(-Math.log10(minStep));
+      const tick = Math.pow(10, -Math.max(0, Math.min(8, exp)));
+      if (tick < 0.01) return 0.01;
+      if (tick > 1) return 0.1;
+      return tick;
+    }
+    const providedTick = (() => {
+      const v = Number(tickSize ?? priceTickSize);
+      return (Number.isFinite(v) && v > 0) ? v : null;
+    })();
+    const tick = providedTick ?? inferTickSize('15m');
+    const floorToTick = (p) => (p == null ? p : Math.floor(p / tick) * tick);
+    const ceilToTick  = (p) => (p == null ? p : Math.ceil(p / tick) * tick);
+    const roundToTick = (p) => (p == null ? p : Math.round(p / tick) * tick);
+
     const suggestions = {};
     for (const lvl of ['level1', 'level2', 'level3']) {
       const m = slMultipliers[lvl];
       const band = bands[lvl] || bands.level1;
-      const { sl, tp1, tp2 } = computeStopsAndTargets(trend, entryPrice, atrRef, m);
-
+      const entryL = roundToTick((band.low + band.high) / 2);
+      let { sl, tp1, tp2 } = computeStopsAndTargets(trend, entryL, atrRef, m);
+      if (trend === 'UP') { sl = floorToTick(sl); tp1 = floorToTick(tp1); tp2 = floorToTick(tp2); }
+      else if (trend === 'DOWN') { sl = ceilToTick(sl); tp1 = ceilToTick(tp1); tp2 = ceilToTick(tp2); }
+      else { sl = roundToTick(sl); tp1 = roundToTick(tp1); tp2 = roundToTick(tp2); }
       suggestions[lvl] = {
-        entry: entryPrice,
-        entry_range: { low: band?.low ?? entryPrice, high: band?.high ?? entryPrice },
+        entry: entryL,
+        entry_range: { low: floorToTick(band?.low ?? entryL), high: ceilToTick(band?.high ?? entryL) },
         stop_loss: sl,
         take_profit_1: tp1,
         take_profit_2: tp2,
@@ -600,18 +835,84 @@ export default async function handler(req, res) {
 
     console.log('[indicators] suggestions sample', { lvl1: suggestions.level1, final_signal });
 
-    // ---------- Output (unchanged schema) ----------
-    const votes = {};
-    for (const tf of Object.keys(tfResults)) votes[tf] = tfResults[tf].signal;
+    // ---------- Gates: readiness for execution ----------
+    function ltfConfirm(dir) {
+      const tf = tfResults['15m'];
+      if (!tf) return false;
+      const ema9 = tf.indicators?.ema9, ema21 = tf.indicators?.ema21;
+      const macd = tf.indicators?.macd, macdSig = tf.indicators?.macd_signal;
+      if (!Number.isFinite(ema9) || !Number.isFinite(ema21) || !Number.isFinite(macd) || !Number.isFinite(macdSig)) return false;
+      if (dir === 'UP') return (ema9 > ema21) && (macd > macdSig);
+      if (dir === 'DOWN') return (ema9 < ema21) && (macd < macdSig);
+      return false;
+    }
+    const bestZone = (Array.isArray(scoredWithFvg) && scoredWithFvg.length) ? scoredWithFvg[0] : null;
+    const zoneMid = bestZone ? (bestZone.low + bestZone.high)/2 : null;
+    const lastPrice = lastClose15 ?? tfResults['15m']?.last?.close ?? null;
+    const pad = Number.isFinite(atrRef) ? atrRef * 0.15 : ((lastPrice ?? 0) * 0.0005);
+    const inZone = (bestZone && lastPrice != null)
+      ? (lastPrice >= (bestZone.low - pad) && lastPrice <= (bestZone.high + pad))
+      : false;
+    const dirMap = final_signal.includes('BUY') ? 'UP' : (final_signal.includes('SELL') ? 'DOWN' : null);
+    const confirm = dirMap ? ltfConfirm(dirMap) : false;
+    // Confidences
+    function clamp01(x){ return Math.max(0, Math.min(1, x)); }
+    const dist = (bestZone && lastPrice != null) ? Math.abs(((bestZone.low+bestZone.high)/2) - lastPrice) : null;
+    const prox = dist == null ? 0 : Math.exp(- (dist*dist) / (2 * Math.pow((atrRef ?? (lastPrice*0.003)) * 0.6, 2)));
+    const entry_confidence = clamp01(0.6 * prox + 0.25 * (bestZone?.score ?? 0) + 0.15 * (confirm ? 1 : 0));
+    const signal_confidence = clamp01(Math.abs((tfResults['1h']?.score ?? 0)) / 40);
+    const ready = (signal_confidence >= 0.6) && (entry_confidence >= 0.6) && confirm && inZone;
 
+    // ---------- Output (scalp, swing-style concise) ----------
     const output = {
       symbol: symbol || null,
       exchangeSymbol: exchangeSymbol || null,
-      final_signal,
-      votesSummary: { byTf: votes },
-      suggestions,
-      reasons: [],        // kept empty for your sheet
-      details: tfResults, // full TF data
+      timestamp: normalized['15m']?.[normalized['15m'].length-1]?.openTime ?? null,
+      last_price: lastPrice,
+      tf_used: '15m',
+      bias: final_signal.includes('BUY') ? 'BUY' : (final_signal.includes('SELL') ? 'SELL' : 'HOLD'),
+      bias_confidence: Number(signal_confidence.toFixed(3)),
+      entry_confidence: Number(entry_confidence.toFixed(3)),
+      position_size_factor: Number((Math.max(0, Math.min(1, (bestZone?.score ?? 0)*0.6 + (confirm?0.2:0) + (prox*0.2)))).toFixed(3)),
+      position_size_tier: (bestZone?.score ?? 0) >= 0.7 ? 'large' : ((bestZone?.score ?? 0) >= 0.4 ? 'normal' : 'small'),
+      primary_zone: bestZone ? {
+        range_low: bestZone.low,
+        range_high: bestZone.high,
+        mid: (bestZone.low + bestZone.high)/2,
+        includes_0714: !!bestZone.includes0714,
+        includes_extension: !!bestZone.includesExt,
+        fvg_overlap: !!bestZone.fvg_overlap,
+        score: Number((bestZone.score ?? 0).toFixed(3)),
+        action: final_signal.includes('BUY') ? 'LONG' : (final_signal.includes('SELL') ? 'SHORT' : null),
+        ltf_ready: !!confirm
+      } : null,
+      alt_zones: (scoredWithFvg || []).slice(1,3).map(z => ({
+        range_low: z.low, range_high: z.high, mid: (z.low+z.high)/2,
+        includes_0714: !!z.includes0714, includes_extension: !!z.includesExt,
+        fvg_overlap: !!z.fvg_overlap, score: Number((z.score ?? 0).toFixed(3))
+      })),
+      order_plan: {
+        side: final_signal.includes('BUY') ? 'LONG' : (final_signal.includes('SELL') ? 'SHORT' : 'FLAT'),
+        entry_range: { low: suggestions.level1.entry_range.low, high: suggestions.level1.entry_range.high },
+        entry: suggestions.level1.entry,
+        stop: suggestions.level1.stop_loss,
+        tp1: suggestions.level1.take_profit_1,
+        tp2: suggestions.level1.take_profit_2,
+        atr_used: suggestions.level1.atr_used,
+        ready
+      },
+      flip_zone: bestZone ? {
+        price: (bestZone.low + bestZone.high)/2,
+        description: bestZone.includes0714 ? 'includes 0.714 confluence' : (bestZone.includesExt ? 'includes extension confluence' : 'confluence zone'),
+        action: final_signal.includes('BUY') ? 'LONG' : (final_signal.includes('SELL') ? 'SHORT' : null),
+        direction_after: final_signal.includes('BUY') ? 'BUY' : (final_signal.includes('SELL') ? 'SELL' : null),
+        confidence: Number((bestZone.score ?? 0).toFixed(3))
+      } : { price: null, description: null, action: null, direction_after: null, confidence: 0 },
+      structure: {
+        bos: bos15 ? { dir: bos15.dir, broken_level: null, impulse_low: bos15.low, impulse_high: bos15.high } : null,
+        swing_support: (() => { const e = lastPrice; if (!e) return null; const lows = swings15?.swingLows || []; const arr = lows.filter(x=>x.price < e).map(x=>x.price); return arr.length? Math.max(...arr): null; })(),
+        swing_resistance: (() => { const e = lastPrice; if (!e) return null; const highs = swings15?.swingHighs || []; const arr = highs.filter(x=>x.price > e).map(x=>x.price); return arr.length? Math.min(...arr): null; })()
+      }
     };
 
     console.log('[indicators] output ready');
