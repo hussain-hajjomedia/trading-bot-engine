@@ -1122,7 +1122,7 @@ module.exports = async function handler(req, res) {
       ? (lp >= (primaryZone.range_low - pad) && lp <= (primaryZone.range_high + pad))
       : false;
     const ready =
-      (bias_confidence >= 0.6) &&
+      (signal_confidence >= 0.6) &&
       (entry_confidence >= 0.6) &&
       !!(primaryZone && primaryZone.ltf_ready) &&
       zoneWithin;
