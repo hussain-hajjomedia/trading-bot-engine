@@ -542,17 +542,27 @@ module.exports = async function handler(req, res) {
       const leg = Math.abs(high - low);
       if (!isFinite(leg) || leg === 0) return null;
       if (imp.dir === 'UP') {
+        const ext1272 = low + 1.272 * (high - low);
         const ext1382 = low + 1.382 * (high - low);
+        const ext1414 = low + 1.414 * (high - low);
         const ext1618 = low + 1.618 * (high - low);
-        const retr50 = low + 0.5 * (high - low);
+        const retr382 = low + 0.382 * (high - low);
+        const retr50  = low + 0.5   * (high - low);
         const retr618 = low + 0.618 * (high - low);
-        return { dir: 'UP', retr50, retr618, ext1382, ext1618, low, high };
+        const retr705 = low + 0.705 * (high - low);
+        const retr786 = low + 0.786 * (high - low);
+        return { dir: 'UP', retr382, retr50, retr618, retr705, retr786, ext1272, ext1382, ext1414, ext1618, low, high };
       } else {
+        const ext1272 = high - 1.272 * (high - low);
         const ext1382 = high - 1.382 * (high - low);
+        const ext1414 = high - 1.414 * (high - low);
         const ext1618 = high - 1.618 * (high - low);
-        const retr50 = high - 0.5 * (high - low);
+        const retr382 = high - 0.382 * (high - low);
+        const retr50  = high - 0.5   * (high - low);
         const retr618 = high - 0.618 * (high - low);
-        return { dir: 'DOWN', retr50, retr618, ext1382, ext1618, low, high };
+        const retr705 = high - 0.705 * (high - low);
+        const retr786 = high - 0.786 * (high - low);
+        return { dir: 'DOWN', retr382, retr50, retr618, retr705, retr786, ext1272, ext1382, ext1414, ext1618, low, high };
       }
     }
 
@@ -578,15 +588,17 @@ module.exports = async function handler(req, res) {
         return 0.0;
       }
       const candidates = [];
-      if (fib.dir === 'UP') {
-        candidates.push({ name: 'retracement 0.5-0.618 zone', low: fib.retr50, high: fib.retr618, score: Math.max(closenessScore(fib.retr50), closenessScore(fib.retr618)) });
-        candidates.push({ name: 'extension 1.382', low: fib.ext1382, high: fib.ext1382, score: closenessScore(fib.ext1382) });
-        candidates.push({ name: 'extension 1.618', low: fib.ext1618, high: fib.ext1618, score: closenessScore(fib.ext1618) });
-      } else {
-        candidates.push({ name: 'retracement 0.5-0.618 zone', low: fib.retr50, high: fib.retr618, score: Math.max(closenessScore(fib.retr50), closenessScore(fib.retr618)) });
-        candidates.push({ name: 'extension 1.382', low: fib.ext1382, high: fib.ext1382, score: closenessScore(fib.ext1382) });
-        candidates.push({ name: 'extension 1.618', low: fib.ext1618, high: fib.ext1618, score: closenessScore(fib.ext1618) });
-      }
+      const pushRetr = (name, lo, hi) => candidates.push({ type: 'retracement', name, low: lo, high: hi, score: Math.max(closenessScore(lo), closenessScore(hi)) });
+      const pushExt  = (name, lv)      => candidates.push({ type: 'extension',   name, low: lv, high: lv, score: closenessScore(lv) });
+      // Retracement zones
+      pushRetr('retracement 0.382', fib.retr382, fib.retr382);
+      pushRetr('retracement 0.5-0.618 zone', fib.retr50, fib.retr618);
+      pushRetr('retracement 0.705-0.786 zone', fib.retr705, fib.retr786);
+      // Extensions
+      pushExt('extension 1.272', fib.ext1272);
+      pushExt('extension 1.382', fib.ext1382);
+      pushExt('extension 1.414', fib.ext1414);
+      pushExt('extension 1.618', fib.ext1618);
 
       // structural support/resistance alignment: check if fib candidate sits near 4h swing high/low
       function structureAlignScore(level) {
@@ -616,7 +628,7 @@ module.exports = async function handler(req, res) {
       // Combine candidate scores
       candidates.forEach(c => {
         const structScore = structureAlignScore((c.low + c.high) / 2);
-        c.combined = (c.score * 0.6 + structScore * 0.25 + smaGapFactor * 0.1 + volFactor * 0.05);
+        c.combined = (c.score * 0.55 + structScore * 0.25 + smaGapFactor * 0.12 + volFactor * 0.08);
       });
       // pick best candidate
       candidates.sort((a,b) => b.combined - a.combined);
@@ -628,6 +640,25 @@ module.exports = async function handler(req, res) {
         const flipMid = (best.low + best.high) / 2
         flip_zone_price = flipMid;
         flip_zone_description = `${best.name} (${flipMid ? flipMid.toFixed(2) : 'n/a'})`;
+        // Determine recommended action at flip zone
+        let flip_zone_action = null;
+        let direction_after_flip = null;
+        if (best.type === 'retracement') {
+          if (fib.dir === 'UP') { flip_zone_action = 'LONG'; direction_after_flip = 'BUY'; }
+          else { flip_zone_action = 'SHORT'; direction_after_flip = 'SELL'; }
+        } else if (best.type === 'extension') {
+          if (fib.dir === 'UP') { flip_zone_action = 'SHORT'; direction_after_flip = 'SELL'; }
+          else { flip_zone_action = 'LONG'; direction_after_flip = 'BUY'; }
+        }
+        // stash for reasons output
+        var _flip_meta = {
+          low: best.low, high: best.high, action: flip_zone_action, direction_after_flip,
+          type: best.type, name: best.name
+        };
+        // also keep top candidates (up to 4) for transparency
+        var _flip_candidates = candidates.slice(0, 4).map(c => ({
+          name: c.name, type: c.type, low: c.low, high: c.high, combined: Number(c.combined?.toFixed(3) || 0)
+        }));
       }
     }
 
@@ -870,8 +901,15 @@ module.exports = async function handler(req, res) {
     reasons.push({
       flip_zone_confidence: flip_zone_confidence,
       flip_zone_price: flip_zone_price,
-      flip_zone_description
+      flip_zone_description,
+      flip_zone_action: (typeof _flip_meta === 'object' ? _flip_meta.action : null),
+      flip_zone_direction_after: (typeof _flip_meta === 'object' ? _flip_meta.direction_after_flip : null),
+      flip_zone_range_low: (typeof _flip_meta === 'object' ? _flip_meta.low : null),
+      flip_zone_range_high: (typeof _flip_meta === 'object' ? _flip_meta.high : null)
     });
+    if (Array.isArray(_flip_candidates) && _flip_candidates.length) {
+      reasons.push({ flip_zone_candidates: _flip_candidates });
+    }
     // add continuous confidences (kept inside reasons to preserve schema)
     reasons.push({
       signal_confidence,
