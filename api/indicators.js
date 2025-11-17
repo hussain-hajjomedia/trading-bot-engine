@@ -108,11 +108,35 @@ module.exports = async function handler(req, res) {
       return arr.slice(arr.length - n);
     }
 
+    // Ensure ascending sort by openTime, dedupe by openTime, drop incomplete last bar if closeTime is in the future
+    function finalizeCandles(rawArr) {
+      if (!Array.isArray(rawArr)) return [];
+      const arr = rawArr
+        .filter(c => c && c.openTime != null && Number.isFinite(Number(c.openTime)));
+      arr.sort((a, b) => Number(a.openTime) - Number(b.openTime));
+      // dedupe by openTime (keep first after sorting)
+      const out = [];
+      const seen = new Set();
+      for (let i = 0; i < arr.length; i++) {
+        const ot = Number(arr[i].openTime);
+        if (seen.has(ot)) continue;
+        seen.add(ot);
+        out.push(arr[i]);
+      }
+      // drop last if it has a future closeTime (in-progress bar)
+      if (out.length) {
+        const last = out[out.length - 1];
+        const ct = last && last.closeTime != null ? Number(last.closeTime) : null;
+        if (ct != null && Number.isFinite(ct) && ct > Date.now()) out.pop();
+      }
+      return out;
+    }
+
     const normalized = {
-      '15m': takeLast(normalizeCandlesRaw(kline_15m), 500),
-      '1h' : takeLast(normalizeCandlesRaw(kline_1h), 500),
-      '4h' : takeLast(normalizeCandlesRaw(kline_4h), 500),
-      '1d' : takeLast(normalizeCandlesRaw(kline_1d), 500),
+      '15m': takeLast(finalizeCandles(normalizeCandlesRaw(kline_15m)), 500),
+      '1h' : takeLast(finalizeCandles(normalizeCandlesRaw(kline_1h)), 500),
+      '4h' : takeLast(finalizeCandles(normalizeCandlesRaw(kline_4h)), 500),
+      '1d' : takeLast(finalizeCandles(normalizeCandlesRaw(kline_1d)), 500),
     };
 
     console.log('[swing] symbol=', symbol, 'lengths=', {
@@ -425,23 +449,15 @@ module.exports = async function handler(req, res) {
     
     console.log('[swing] voting:', { buyWeight, sellWeight, final_signal });
 
-    // ---------- Multi-TF ATR normalization ----------
-    function pickAtrMulti() {
-      const a1d = tfResults['1d']?.indicators?.atr14 ?? null;
+    // ---------- ATR reference (4h) ----------
+    function pickAtr4h() {
       const a4h = tfResults['4h']?.indicators?.atr14 ?? null;
-      const a1h = tfResults['1h']?.indicators?.atr14 ?? null;
-      // Weighted blend favoring 4h/1d for swing sizing
-      const weights = { '1d': 0.45, '4h': 0.35, '1h': 0.2 };
-      let sum = 0, denom = 0;
-      if (a1d != null) { sum += a1d * weights['1d']; denom += weights['1d']; }
-      if (a4h != null) { sum += a4h * weights['4h']; denom += weights['4h']; }
-      if (a1h != null) { sum += a1h * weights['1h']; denom += weights['1h']; }
-      if (denom === 0) return null;
-      return sum / denom;
+      return a4h != null ? a4h : null;
     }
-    let atrRef = pickAtrMulti();
+    let atrRef = pickAtr4h();
     const fallbackPrice = tfResults['4h']?.last?.close ?? tfResults['1h']?.last?.close ?? tfResults['15m']?.last?.close ?? null;
-    if (atrRef == null && fallbackPrice != null) atrRef = Math.max(1, fallbackPrice * 0.005);
+    // Percent-of-price fallback only; no absolute floors
+    if (atrRef == null && fallbackPrice != null) atrRef = fallbackPrice * 0.003;
 
     // ---------- Swing structure & Fibonacci projections ----------
     // Prefer 4h for swing structure, fallback to 1h then 15m
@@ -581,8 +597,16 @@ module.exports = async function handler(req, res) {
     const lastClose = ref?.last?.close ?? fallbackPrice;
 
     // structure-based levels: nearest swing support/resistance
-    const structureLow = nearestSwingBelow(lastClose, swings4h.swingLows.map(s => ({price: s.price})).map(s=>s.price) ? swings4h.swingLows : swings1h.swingLows) || (lastClose - atrRef * 2);
-    const structureHigh = nearestSwingAbove(lastClose, swings4h.swingHighs.map(s => ({price: s.price})).map(s=>s.price) ? swings4h.swingHighs : swings1h.swingHighs) || (lastClose + atrRef * 2);
+    const lowsPool =
+      (Array.isArray(swings4h?.swingLows) && swings4h.swingLows.length) ? swings4h.swingLows :
+      (Array.isArray(swings1h?.swingLows) && swings1h.swingLows.length) ? swings1h.swingLows :
+      (Array.isArray(swings15?.swingLows) && swings15.swingLows.length) ? swings15.swingLows : [];
+    const highsPool =
+      (Array.isArray(swings4h?.swingHighs) && swings4h.swingHighs.length) ? swings4h.swingHighs :
+      (Array.isArray(swings1h?.swingHighs) && swings1h.swingHighs.length) ? swings1h.swingHighs :
+      (Array.isArray(swings15?.swingHighs) && swings15.swingHighs.length) ? swings15.swingHighs : [];
+    const structureLow = nearestSwingBelow(lastClose, lowsPool) ?? ((lastClose != null && atrRef != null) ? (lastClose - atrRef * 2) : null);
+    const structureHigh = nearestSwingAbove(lastClose, highsPool) ?? ((lastClose != null && atrRef != null) ? (lastClose + atrRef * 2) : null);
 
     // compute base rawEntry similar to prior logic but with stronger structure bias
     let rawEntryLow = null, rawEntryHigh = null;
