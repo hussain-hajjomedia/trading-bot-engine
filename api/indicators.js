@@ -826,6 +826,38 @@ module.exports = async function handler(req, res) {
       };
     }
 
+    // ---------- Confidence scoring (continuous 0..1) ----------
+    function clamp01(x) { return Math.max(0, Math.min(1, x)); }
+    // Signal confidence from vote dominance and reference TF score magnitude
+    const totalW = Object.keys(tfResults).reduce((s, tf) => s + (tfWeight[tf] || 0), 0);
+    const voteDominance = totalW ? Math.abs((buyWeight ?? 0) - (sellWeight ?? 0)) / totalW : 0;
+    const refScore = Math.abs(ref?.score ?? 0);
+    const scoreNorm = clamp01(refScore / 60);
+    const signal_confidence = clamp01(0.6 * voteDominance + 0.4 * scoreNorm);
+    // Entry confidence from band proximity, structure alignment, and supertrend alignment
+    function gaussian(x, s) { if (!Number.isFinite(x) || !Number.isFinite(s) || s <= 0) return 0; return Math.exp(-(x*x)/(2*s*s)); }
+    const bandMid = (lvl1.low != null && lvl1.high != null) ? (lvl1.low + lvl1.high) / 2 : lastClose;
+    const distToBand = (lastClose != null && bandMid != null) ? Math.abs(lastClose - bandMid) : null;
+    const bandProx = distToBand == null ? 0 : gaussian(distToBand, (atrRef ?? (lastClose*0.003)) * 0.6);
+    const structProx = (() => {
+      if (bandMid == null) return 0;
+      const candidates = [];
+      if (Number.isFinite(structureLow)) candidates.push(Math.abs(bandMid - structureLow));
+      if (Number.isFinite(structureHigh)) candidates.push(Math.abs(bandMid - structureHigh));
+      if (!candidates.length) return 0;
+      const d = Math.min(...candidates);
+      const s = (atrRef ?? (lastClose*0.003)) * 1.2;
+      return gaussian(d, s);
+    })();
+    const stAlign = (() => {
+      const stv = ref?.indicators?.supertrend ?? null;
+      if (stv == null || lastClose == null) return 0.4;
+      if (final_signal.includes('BUY'))  return lastClose > stv ? 1.0 : 0.2;
+      if (final_signal.includes('SELL')) return lastClose < stv ? 1.0 : 0.2;
+      return 0.5;
+    })();
+    const entry_confidence = clamp01(0.55 * bandProx + 0.25 * structProx + 0.20 * stAlign);
+
     // ---------- Compose final output (structure preserved) ----------
     // Build reasons array like before but include flip_zone_confidence as an object entry so sheet can pick it up
     const reasons = [];
@@ -839,6 +871,11 @@ module.exports = async function handler(req, res) {
       flip_zone_confidence: flip_zone_confidence,
       flip_zone_price: flip_zone_price,
       flip_zone_description
+    });
+    // add continuous confidences (kept inside reasons to preserve schema)
+    reasons.push({
+      signal_confidence,
+      entry_confidence
     });
 
     const output = {
