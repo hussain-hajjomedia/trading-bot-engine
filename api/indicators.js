@@ -653,49 +653,58 @@ module.exports = async function handler(req, res) {
     const structureLow = nearestSwingBelow(lastClose, lowsPool) ?? ((lastClose != null && atrRef != null) ? (lastClose - atrRef * 2) : null);
     const structureHigh = nearestSwingAbove(lastClose, highsPool) ?? ((lastClose != null && atrRef != null) ? (lastClose + atrRef * 2) : null);
 
-    // compute base rawEntry similar to prior logic but with stronger structure bias
-    let rawEntryLow = null, rawEntryHigh = null;
-    const ema9v = ref?.indicators?.ema9, stv = ref?.indicators?.supertrend;
-    if (final_signal.includes('BUY')) {
-      if (ema9v != null && stv != null) { rawEntryLow = Math.min(ema9v, stv, structureLow); rawEntryHigh = Math.max(ema9v, structureLow); }
-      else if (ema9v != null) { rawEntryLow = ema9v * 0.995; rawEntryHigh = ema9v * 1.002; }
-      else { rawEntryLow = lastClose * 0.995; rawEntryHigh = lastClose * 1.002; }
-    } else if (final_signal.includes('SELL')) {
-      if (ema9v != null && stv != null) { rawEntryLow = Math.min(ema9v, structureHigh); rawEntryHigh = Math.max(ema9v, stv, structureHigh); }
-      else if (ema9v != null) { rawEntryLow = ema9v * 0.998; rawEntryHigh = ema9v * 1.005; }
-      else { rawEntryLow = lastClose * 0.998; rawEntryHigh = lastClose * 1.002; }
-    } else {
-      rawEntryLow = lastClose; rawEntryHigh = lastClose;
-    }
-
-    // clamp low/high percent windows (swing-friendly)
-    const MAX_ENTRY_PCT = 0.02; // 2% for swing
-    const MAX_ENTRY_PCT_L2 = 0.04;
-    const MAX_ENTRY_PCT_L3 = 0.06;
-    const MIN_ENTRY_PCT = 0.001;
-
-    function clampEntryRange(rawLow, rawHigh, lastPrice, maxPct) {
-      if (!lastPrice || rawLow == null || rawHigh == null) return { low: rawLow, high: rawHigh };
-      if (rawLow > rawHigh) { const t = rawLow; rawLow = rawHigh; rawHigh = t; }
-      const lowPct = Math.abs((rawLow - lastPrice) / lastPrice);
-      const highPct = Math.abs((rawHigh - lastPrice) / lastPrice);
-      const cappedLow = lowPct > maxPct ? (rawLow < lastPrice ? lastPrice * (1 - maxPct) : lastPrice * (1 + maxPct)) : rawLow;
-      const cappedHigh = highPct > maxPct ? (rawHigh < lastPrice ? lastPrice * (1 - maxPct) : lastPrice * (1 + maxPct)) : rawHigh;
-      let finalLow = Math.min(cappedLow, cappedHigh);
-      let finalHigh = Math.max(cappedLow, cappedHigh);
-      const widthPct = Math.abs((finalHigh - finalLow) / Math.max(1, lastPrice));
-      if (widthPct < MIN_ENTRY_PCT) {
-        const half = (MIN_ENTRY_PCT * lastPrice) / 2;
-        finalLow = lastPrice - half;
-        finalHigh = lastPrice + half;
+    // Build EMA21/EMA50 + Fib 0.5–0.618 confluence band on reference TF, sized by ATR
+    function buildConfluenceBands() {
+      if (lastClose == null) return null;
+      const closesRef = (normalized[refTf] || []).map(c => toNum(c.close));
+      const ema21Arr = ema(closesRef, 21);
+      const ema50Arr = ema(closesRef, 50);
+      const ema21v = ema21Arr[ema21Arr.length - 1];
+      const ema50v = ema50Arr[ema50Arr.length - 1];
+      const emaBand = (ema21v != null && ema50v != null)
+        ? { low: Math.min(ema21v, ema50v), high: Math.max(ema21v, ema50v) }
+        : null;
+      const fibBand = fib
+        ? { low: Math.min(fib.retr50, fib.retr618), high: Math.max(fib.retr50, fib.retr618) }
+        : null;
+      function overlap(a, b) {
+        if (!a || !b) return null;
+        const lo = Math.max(a.low, b.low);
+        const hi = Math.min(a.high, b.high);
+        return lo <= hi ? { low: lo, high: hi } : null;
       }
-      return { low: finalLow, high: finalHigh };
+      let base = overlap(emaBand, fibBand) || emaBand || fibBand || { low: lastClose, high: lastClose };
+      // If no overlap and both exist, pick the one closer to lastClose
+      if (!overlap(emaBand, fibBand) && emaBand && fibBand) {
+        const midE = (emaBand.low + emaBand.high) / 2;
+        const midF = (fibBand.low + fibBand.high) / 2;
+        base = Math.abs(lastClose - midE) <= Math.abs(lastClose - midF) ? emaBand : fibBand;
+      }
+      const a = Number.isFinite(atrRef) ? atrRef : (lastClose * 0.003);
+      const pad1 = a * 0.15;
+      const pad2 = a * 0.25;
+      const pad3 = a * 0.40;
+      function expand(band, pad) {
+        if (!band || band.low == null || band.high == null) return { low: lastClose, high: lastClose };
+        let lo = Math.min(band.low, band.high) - pad;
+        let hi = Math.max(band.low, band.high) + pad;
+        // Ensure non-zero width: at least 0.1 * ATR
+        const minW = Math.max(a * 0.1, lastClose * 0.0005);
+        if ((hi - lo) < minW) {
+          const mid = (lo + hi) / 2;
+          lo = mid - minW / 2;
+          hi = mid + minW / 2;
+        }
+        return { low: lo, high: hi };
+      }
+      return {
+        level1: expand(base, pad1),
+        level2: expand(base, pad2),
+        level3: expand(base, pad3),
+      };
     }
-
-    const lvl1 = clampEntryRange(rawEntryLow, rawEntryHigh, lastClose, MAX_ENTRY_PCT);
-    const lvl2 = clampEntryRange(rawEntryLow, rawEntryHigh, lastClose, MAX_ENTRY_PCT_L2);
-    const lvl3 = clampEntryRange(rawEntryLow, rawEntryHigh, lastClose, MAX_ENTRY_PCT_L3);
-
+    const bands = buildConfluenceBands() || { level1: { low: lastClose, high: lastClose }, level2: { low: lastClose, high: lastClose }, level3: { low: lastClose, high: lastClose } };
+    const lvl1 = bands.level1, lvl2 = bands.level2, lvl3 = bands.level3;
     const entryPrice = (lvl1.low != null && lvl1.high != null) ? (lvl1.low + lvl1.high) / 2 : (lastClose != null ? lastClose : null);
 
     // ---------- SL/TP via ATR and Fib (if useful) ----------
@@ -754,13 +763,64 @@ module.exports = async function handler(req, res) {
         tp2 = clamp(tp2, entry, 0.2);
       }
 
+      // Quantize to inferred tick size
+      function inferTickSize(tfName) {
+        const arr = normalized[tfName] || [];
+        const vals = [];
+        const push = (v) => { const n = Number(v); if (Number.isFinite(n)) vals.push(n); };
+        for (let i = Math.max(0, arr.length - 200); i < arr.length; i++) {
+          const c = arr[i];
+          push(c.close); push(c.open); push(c.high); push(c.low);
+        }
+        if (vals.length < 2) return 0.01;
+        vals.sort((a,b)=>a-b);
+        let minStep = Infinity;
+        for (let i = 1; i < vals.length; i++) {
+          const d = Math.abs(vals[i] - vals[i-1]);
+          if (d > 0) minStep = Math.min(minStep, d);
+        }
+        if (!Number.isFinite(minStep) || minStep === 0) return 0.01;
+        // normalize to a clean decimal step
+        const exp = Math.ceil(-Math.log10(minStep));
+        const tick = Math.pow(10, -Math.max(0, Math.min(8, exp)));
+        // snap to common BTCUSDT steps where applicable
+        if (tick < 0.01) return 0.01;
+        if (tick > 1) return 0.1;
+        return tick;
+      }
+      const tick = inferTickSize(refTf);
+      const side = final_signal.includes('BUY') ? 'LONG' : (final_signal.includes('SELL') ? 'SHORT' : 'FLAT');
+      const floorToTick = (p) => (p == null ? p : Math.floor(p / tick) * tick);
+      const ceilToTick  = (p) => (p == null ? p : Math.ceil(p / tick) * tick);
+      const roundToTick = (p) => (p == null ? p : Math.round(p / tick) * tick);
+
+      const qEntry = roundToTick(entry);
+      let qSL = sl;
+      let qTP1 = tp1;
+      let qTP2 = tp2;
+      if (side === 'LONG') {
+        qSL  = floorToTick(sl);
+        qTP1 = floorToTick(tp1);
+        qTP2 = floorToTick(tp2);
+      } else if (side === 'SHORT') {
+        qSL  = ceilToTick(sl);
+        qTP1 = ceilToTick(tp1);
+        qTP2 = ceilToTick(tp2);
+      } else {
+        qSL  = roundToTick(sl);
+        qTP1 = roundToTick(tp1);
+        qTP2 = roundToTick(tp2);
+      }
+
+      const qBandLow  = floorToTick(lvl === 'level1' ? lvl1.low : (lvl === 'level2' ? lvl2.low : lvl3.low));
+      const qBandHigh = ceilToTick (lvl === 'level1' ? lvl1.high: (lvl === 'level2' ? lvl2.high: lvl3.high));
+
       suggestions[lvl] = {
-        entry: entry,
-        entry_range: { low: lvl === 'level1' ? lvl1.low : (lvl === 'level2' ? lvl2.low : lvl3.low),
-                       high: lvl === 'level1' ? lvl1.high : (lvl === 'level2' ? lvl2.high : lvl3.high) },
-        stop_loss: sl,
-        take_profit_1: tp1,
-        take_profit_2: tp2,
+        entry: qEntry,
+        entry_range: { low: qBandLow, high: qBandHigh },
+        stop_loss: qSL,
+        take_profit_1: qTP1,
+        take_profit_2: qTP2,
         atr_used: atrRef,
         sl_multiplier: m,
       };
