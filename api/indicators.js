@@ -235,22 +235,42 @@ module.exports = async function handler(req, res) {
       return out;
     }
 
-    function superTrend(highs, lows, closes, period = 10, mult = 3) {
+    function superTrendCanonical(highs, lows, closes, period = 10, mult = 3) {
+      const len = closes.length;
       const atrArr = atr(highs, lows, closes, period);
       const hl2 = highs.map((h, i) => (h + lows[i]) / 2);
-      const upper = hl2.map((v, i) => v + mult * (atrArr[i] == null ? 0 : atrArr[i]));
-      const lower = hl2.map((v, i) => v - mult * (atrArr[i] == null ? 0 : atrArr[i]));
-      const finalUpper = new Array(closes.length).fill(null);
-      const finalLower = new Array(closes.length).fill(null);
-      const st = new Array(closes.length).fill(null);
-      for (let i = 0; i < closes.length; i++) {
-        if (i === 0) { finalUpper[i] = upper[i]; finalLower[i] = lower[i]; continue; }
-        finalUpper[i] = Math.min(upper[i] == null ? Infinity : upper[i], finalUpper[i - 1] == null ? Infinity : finalUpper[i - 1]);
-        finalLower[i] = Math.max(lower[i] == null ? -Infinity : lower[i], finalLower[i - 1] == null ? -Infinity : finalLower[i - 1]);
-        if (finalLower[i] == null || finalUpper[i] == null) st[i] = null;
-        else st[i] = closes[i] > finalLower[i] ? finalLower[i] : finalUpper[i];
+      const upperBasic = hl2.map((v, i) => v + mult * (atrArr[i] == null ? 0 : atrArr[i]));
+      const lowerBasic = hl2.map((v, i) => v - mult * (atrArr[i] == null ? 0 : atrArr[i]));
+      const finalUpper = new Array(len).fill(null);
+      const finalLower = new Array(len).fill(null);
+      const st = new Array(len).fill(null);
+      const trend = new Array(len).fill(null); // 1 up, -1 down
+      for (let i = 0; i < len; i++) {
+        if (i === 0) {
+          finalUpper[i] = upperBasic[i];
+          finalLower[i] = lowerBasic[i];
+          st[i] = null;
+          trend[i] = null;
+          continue;
+        }
+        // Carry-forward logic (classic ST)
+        finalUpper[i] = (upperBasic[i] < (finalUpper[i - 1] == null ? Infinity : finalUpper[i - 1]) || closes[i - 1] > (finalUpper[i - 1] == null ? Infinity : finalUpper[i - 1]))
+          ? upperBasic[i]
+          : finalUpper[i - 1];
+        finalLower[i] = (lowerBasic[i] > (finalLower[i - 1] == null ? -Infinity : finalLower[i - 1]) || closes[i - 1] < (finalLower[i - 1] == null ? -Infinity : finalLower[i - 1]))
+          ? lowerBasic[i]
+          : finalLower[i - 1];
+        // Determine current ST band and trend state
+        if (st[i - 1] == null) {
+          st[i] = closes[i] >= finalLower[i] ? finalLower[i] : finalUpper[i];
+        } else if (st[i - 1] === finalUpper[i - 1]) {
+          st[i] = closes[i] <= finalUpper[i] ? finalUpper[i] : finalLower[i];
+        } else {
+          st[i] = closes[i] >= finalLower[i] ? finalLower[i] : finalUpper[i];
+        }
+        trend[i] = (st[i] === finalLower[i]) ? 1 : -1;
       }
-      return st;
+      return { st, trend };
     }
 
     // ---------- Micro-structure (swing points) ----------
@@ -301,7 +321,8 @@ module.exports = async function handler(req, res) {
       const rsi14 = rsiWilder(closes, 14);
       const macdObj = macd(closes);
       const atr14 = atr(highs, lows, closes, 14);
-      const st = superTrend(highs, lows, closes, 10, 3);
+      const stObj = superTrendCanonical(highs, lows, closes, 10, 3);
+      const st = stObj.st;
       const volSMA20 = sma(volumes, 20);
 
       const i = closes.length - 1;
@@ -465,30 +486,54 @@ module.exports = async function handler(req, res) {
     const swings1h = findSwingPoints(normalized['1h'], 3);
     const swings15 = findSwingPoints(normalized['15m'], 3);
 
-    // Attempt to build last meaningful impulse on 4h
-    function lastImpulseFromSwings(sw) {
-      if (!sw) return null;
-      const highs = sw.swingHighs;
-      const lows = sw.swingLows;
+    // Dominant impulse detection from swings with ATR/recency threshold (prefer 4h)
+    function dominantImpulseFromSwings(sw, atrVal, refPrice, maxLegs = 12) {
+      if (!sw || !Array.isArray(sw.swingHighs) || !Array.isArray(sw.swingLows)) return null;
+      const highs = sw.swingHighs.slice();
+      const lows = sw.swingLows.slice();
       if (!highs.length || !lows.length) return null;
-      const lastHigh = highs[highs.length - 1];
-      const lastLow = lows[lows.length - 1];
-      if (lastLow.index < lastHigh.index) return { dir: 'UP', low: lastLow.price, high: lastHigh.price };
-      if (lastHigh.index < lastLow.index) return { dir: 'DOWN', high: lastHigh.price, low: lastLow.price };
-      return null;
+      // Merge pivots by index
+      const pivots = [
+        ...highs.map(h => ({ type: 'H', index: h.index, price: h.price })),
+        ...lows.map(l => ({ type: 'L', index: l.index, price: l.price })),
+      ].sort((a, b) => a.index - b.index);
+      // Build legs between alternating pivot types
+      const legs = [];
+      for (let i = 1; i < pivots.length; i++) {
+        const a = pivots[i - 1], b = pivots[i];
+        if (a.type === b.type) continue;
+        if (a.type === 'L' && b.type === 'H') {
+          legs.push({ dir: 'UP', low: a.price, high: b.price, start: a.index, end: b.index });
+        } else if (a.type === 'H' && b.type === 'L') {
+          legs.push({ dir: 'DOWN', high: a.price, low: b.price, start: a.index, end: b.index });
+        }
+      }
+      if (!legs.length) return null;
+      // Consider only the last N legs
+      const recent = legs.slice(-maxLegs);
+      const price = refPrice != null ? refPrice : (recent.length ? (recent[recent.length - 1].high + recent[recent.length - 1].low) / 2 : null);
+      const atr = atrVal != null ? atrVal : (price != null ? price * 0.003 : 0);
+      const sizeThreshold = Math.max(atr * 2.5, (price != null ? price * 0.003 : 0));
+      // Pick the most recent leg meeting threshold; else pick the largest recent leg
+      for (let i = recent.length - 1; i >= 0; i--) {
+        const leg = recent[i];
+        const sz = Math.abs((leg.high ?? 0) - (leg.low ?? 0));
+        if (sz >= sizeThreshold && Number.isFinite(sz) && sz > 0) return leg;
+      }
+      // Fallback: largest leg among recent
+      let best = null, bestSize = -Infinity;
+      for (const leg of recent) {
+        const sz = Math.abs((leg.high ?? 0) - (leg.low ?? 0));
+        if (Number.isFinite(sz) && sz > bestSize) { best = leg; bestSize = sz; }
+      }
+      return best;
     }
 
-    const imp4 = lastImpulseFromSwings(swings4h);
-    const imp1 = lastImpulseFromSwings(swings1h);
-    const imp15 = lastImpulseFromSwings(swings15);
-
-    // choose the strongest leg among available (prefer 4h)
-    let impulse = imp4 || imp1 || imp15;
-    if (imp4 && imp1) {
-      const size4 = Math.abs(imp4.high - imp4.low);
-      const size1 = Math.abs(imp1.high - imp1.low);
-      impulse = (size4 >= size1 * 0.8) ? imp4 : imp1;
-    }
+    let impulse =
+      dominantImpulseFromSwings(swings4h, atrRef, fallbackPrice) ||
+      dominantImpulseFromSwings(swings1h, atrRef, fallbackPrice) ||
+      dominantImpulseFromSwings(swings15, atrRef, fallbackPrice) ||
+      null;
 
     // compute fib extension/projection for that impulse
     function computeFibForImpulse(imp) {
