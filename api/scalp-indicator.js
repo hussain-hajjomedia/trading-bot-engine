@@ -704,13 +704,14 @@ export default async function handler(req, res) {
     }
 
     const bands = bandsForLevels();
-    console.log('[indicators] bands', bands, 'basePrice', basePrice);
+    console.log('[indicators] bands', bands ? { level1: bands.level1, level2: bands.level2, level3: bands.level3 } : null, 'basePrice', basePrice);
 
-    // Entry price = mid of level1 band (consistent)
+    // Entry price = mid of level1 band (consistent) when bands exist
     const entryPrice = (() => {
+      if (!bands || !bands.level1) return null;
       const b = bands.level1;
       if (b && b.low != null && b.high != null) return (b.low + b.high) / 2;
-      return basePrice;
+      return null;
     })();
 
     // ---------- Stops & Targets ----------
@@ -821,26 +822,28 @@ export default async function handler(req, res) {
     const roundToTick = (p) => (p == null ? p : Math.round(p / tick) * tick);
 
     const suggestions = {};
-    for (const lvl of ['level1', 'level2', 'level3']) {
-      const m = slMultipliers[lvl];
-      const band = bands[lvl] || bands.level1;
-      const entryL = roundToTick((band.low + band.high) / 2);
-      let { sl, tp1, tp2 } = computeStopsAndTargets(trend, entryL, atrRef, m);
-      if (trend === 'UP') { sl = floorToTick(sl); tp1 = floorToTick(tp1); tp2 = floorToTick(tp2); }
-      else if (trend === 'DOWN') { sl = ceilToTick(sl); tp1 = ceilToTick(tp1); tp2 = ceilToTick(tp2); }
-      else { sl = roundToTick(sl); tp1 = roundToTick(tp1); tp2 = roundToTick(tp2); }
-      suggestions[lvl] = {
-        entry: entryL,
-        entry_range: { low: floorToTick(band?.low ?? entryL), high: ceilToTick(band?.high ?? entryL) },
-        stop_loss: sl,
-        take_profit_1: tp1,
-        take_profit_2: tp2,
-        atr_used: atrRef,
-        sl_multiplier: m,
-      };
+    if (bands && bands.level1 && bands.level2 && bands.level3) {
+      for (const lvl of ['level1', 'level2', 'level3']) {
+        const m = slMultipliers[lvl];
+        const band = bands[lvl] || bands.level1;
+        const entryL = roundToTick((band.low + band.high) / 2);
+        let { sl, tp1, tp2 } = computeStopsAndTargets(trend, entryL, atrRef, m);
+        if (trend === 'UP') { sl = floorToTick(sl); tp1 = floorToTick(tp1); tp2 = floorToTick(tp2); }
+        else if (trend === 'DOWN') { sl = ceilToTick(sl); tp1 = ceilToTick(tp1); tp2 = ceilToTick(tp2); }
+        else { sl = roundToTick(sl); tp1 = roundToTick(tp1); tp2 = roundToTick(tp2); }
+        suggestions[lvl] = {
+          entry: entryL,
+          entry_range: { low: floorToTick(band?.low ?? entryL), high: ceilToTick(band?.high ?? entryL) },
+          stop_loss: sl,
+          take_profit_1: tp1,
+          take_profit_2: tp2,
+          atr_used: atrRef,
+          sl_multiplier: m,
+        };
+      }
     }
 
-    console.log('[indicators] suggestions sample', { lvl1: suggestions.level1, final_signal });
+    if (suggestions.level1) console.log('[indicators] suggestions sample', { lvl1: suggestions.level1, final_signal });
 
     // ---------- Gates: readiness for execution ----------
     function ltfConfirm(dir) {
