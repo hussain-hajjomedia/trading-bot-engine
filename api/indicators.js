@@ -8,7 +8,7 @@ module.exports = async function handler(req, res) {
 
   try {
     const payload = req.body || {};
-    let { symbol, exchangeSymbol, kline_15m, kline_1h, kline_4h, kline_1d } = payload;
+    let { symbol, exchangeSymbol, kline_15m, kline_1h, kline_4h, kline_1d, tickSize, priceTickSize, stepSize } = payload;
 
     // ---------- Utilities ----------
     function tryParseMaybeJson(input) {
@@ -486,6 +486,39 @@ module.exports = async function handler(req, res) {
     const swings1h = findSwingPoints(normalized['1h'], 3);
     const swings15 = findSwingPoints(normalized['15m'], 3);
 
+    // Break-of-Structure detection on 4h
+    function detectBosFromSwings(candles, swings) {
+      if (!candles || !candles.length || !swings) return null;
+      const closes = candles.map(c => toNum(c.close));
+      const lastClose = closes[closes.length - 1];
+      const sh = (swings.swingHighs || []).map(x => x.index).sort((a,b)=>a-b);
+      const sl = (swings.swingLows  || []).map(x => x.index).sort((a,b)=>a-b);
+      if (!sh.length || !sl.length) return null;
+      const lastHighIdx = sh[sh.length - 1];
+      const lastLowIdx  = sl[sl.length - 1];
+      const lastHighVal = toNum(candles[lastHighIdx]?.high);
+      const lastLowVal  = toNum(candles[lastLowIdx]?.low);
+      let dir = null, brokenLevel = null;
+      if (Number.isFinite(lastHighVal) && lastClose > lastHighVal) { dir = 'UP'; brokenLevel = lastHighVal; }
+      else if (Number.isFinite(lastLowVal) && lastClose < lastLowVal) { dir = 'DOWN'; brokenLevel = lastLowVal; }
+      if (!dir) return null;
+      // Impulse causing BOS: last opposite swing to broken swing
+      let startIdx = null, endIdx = null, low = null, high = null;
+      if (dir === 'UP') {
+        // from last swing low up to the broken swing high
+        const prevLowIdx = sl[sl.length - 1];
+        startIdx = prevLowIdx; endIdx = lastHighIdx;
+        low = toNum(candles[startIdx]?.low); high = toNum(candles[endIdx]?.high);
+      } else {
+        const prevHighIdx = sh[sh.length - 1];
+        startIdx = prevHighIdx; endIdx = lastLowIdx;
+        high = toNum(candles[startIdx]?.high); low = toNum(candles[endIdx]?.low);
+      }
+      if (!Number.isFinite(low) || !Number.isFinite(high) || startIdx == null || endIdx == null) return null;
+      return { dir, brokenLevel, startIdx, endIdx, low, high };
+    }
+    const bos = detectBosFromSwings(normalized['4h'], swings4h);
+
     // Dominant impulse detection from swings with ATR/recency threshold (prefer 4h)
     function dominantImpulseFromSwings(sw, atrVal, refPrice, maxLegs = 12) {
       if (!sw || !Array.isArray(sw.swingHighs) || !Array.isArray(sw.swingLows)) return null;
@@ -534,6 +567,10 @@ module.exports = async function handler(req, res) {
       dominantImpulseFromSwings(swings1h, atrRef, fallbackPrice) ||
       dominantImpulseFromSwings(swings15, atrRef, fallbackPrice) ||
       null;
+    // Prefer BOS impulse when available
+    if (bos && Number.isFinite(bos.low) && Number.isFinite(bos.high)) {
+      impulse = { dir: bos.dir, low: bos.low, high: bos.high, start: bos.startIdx, end: bos.endIdx };
+    }
 
     // compute fib extension/projection for that impulse
     function computeFibForImpulse(imp) {
@@ -664,6 +701,115 @@ module.exports = async function handler(req, res) {
 
     console.log('[swing] fib & flip:', { fibExists: !!fib, flip_zone_confidence, flip_zone_description });
 
+    // ---------- Multi-impulse confluence (golden pocket + 0.714 focus) ----------
+    function buildImpulseList(sw) {
+      if (!sw || !sw.swingHighs || !sw.swingLows) return [];
+      const pivots = [
+        ...sw.swingHighs.map(h => ({ t: 'H', i: h.index, p: h.price })),
+        ...sw.swingLows.map(l => ({ t: 'L', i: l.index, p: l.price })),
+      ].sort((a,b)=>a.i-b.i);
+      const legs = [];
+      for (let k = 1; k < pivots.length; k++) {
+        const a = pivots[k-1], b = pivots[k];
+        if (a.t === b.t) continue;
+        if (a.t === 'L' && b.t === 'H') legs.push({ dir:'UP', low:a.p, high:b.p, start:a.i, end:b.i });
+        if (a.t === 'H' && b.t === 'L') legs.push({ dir:'DOWN', high:a.p, low:b.p, start:a.i, end:b.i });
+      }
+      return legs.slice(-6);
+    }
+    function fibsForLeg(leg) {
+      return computeFibForImpulse(leg);
+    }
+    const legs4h = buildImpulseList(swings4h);
+    const fibsList = legs4h.map(fibsForLeg).filter(Boolean);
+    // Build candidate zones emphasizing golden pocket (0.618-0.65) and 0.714; plus 1.382/1.618 extensions
+    function zonesFromFib(f) {
+      const zones = [];
+      const gpLow = f.dir === 'UP' ? (f.low + 0.618*(f.high - f.low)) : (f.high - 0.65*(f.high - f.low)); // compute properly
+      const gpHigh = f.dir === 'UP' ? (f.low + 0.65*(f.high - f.low)) : (f.high - 0.618*(f.high - f.low));
+      const z_gp = { label:'golden_pocket_0.618_0.65', type:'retracement', low: Math.min(gpLow,gpHigh), high: Math.max(gpLow,gpHigh), dir:f.dir };
+      const z_0714 = { label:'retracement_0.714', type:'retracement',
+        low: f.dir==='UP' ? (f.low + 0.714*(f.high - f.low)) : (f.high - 0.714*(f.high - f.low)),
+        high: f.dir==='UP' ? (f.low + 0.714*(f.high - f.low)) : (f.high - 0.714*(f.high - f.low)),
+        dir:f.dir };
+      const z_ext1382 = { label:'extension_1.382', type:'extension',
+        low: f.ext1382, high: f.ext1382, dir:f.dir };
+      const z_ext1618 = { label:'extension_1.618', type:'extension',
+        low: f.ext1618, high: f.ext1618, dir:f.dir };
+      zones.push(z_gp, z_0714, z_ext1382, z_ext1618);
+      return zones;
+    }
+    const allZones = fibsList.flatMap(zonesFromFib).filter(z => Number.isFinite(z.low) && Number.isFinite(z.high));
+    // Merge overlaps into hot zones
+    function overlapRange(a,b) {
+      const lo = Math.max(Math.min(a.low,a.high), Math.min(b.low,b.high));
+      const hi = Math.min(Math.max(a.low,a.high), Math.max(b.low,b.high));
+      return lo <= hi ? { low: lo, high: hi } : null;
+    }
+    const hotZones = [];
+    for (let i = 0; i < allZones.length; i++) {
+      for (let j = i+1; j < allZones.length; j++) {
+        const o = overlapRange(allZones[i], allZones[j]);
+        if (o) {
+          const includes0714 = (allZones[i].label.includes('0.714') || allZones[j].label.includes('0.714')) ? true : false;
+          const includesExt = (allZones[i].type === 'extension' || allZones[j].type === 'extension');
+          hotZones.push({
+            low:o.low, high:o.high,
+            includes0714,
+            includesExt,
+            labels:[allZones[i].label, allZones[j].label],
+            dirs:[allZones[i].dir, allZones[j].dir]
+          });
+        }
+      }
+    }
+    // ---------- FVG detection on 4h and 1h ----------
+    function detectFVG(candles) {
+      const out = [];
+      for (let i = 1; i < candles.length - 1; i++) {
+        const prev = candles[i-1], cur = candles[i], next = candles[i+1];
+        if (!prev || !cur || !next) continue;
+        const prevHigh = toNum(prev.high), prevLow = toNum(prev.low);
+        const nextHigh = toNum(next.high), nextLow = toNum(next.low);
+        // Bullish FVG: nextLow > prevHigh
+        if (Number.isFinite(nextLow) && Number.isFinite(prevHigh) && nextLow > prevHigh) {
+          out.push({ type:'bull', low: prevHigh, high: nextLow, center: (prevHigh + nextLow)/2, index:i });
+        }
+        // Bearish FVG: nextHigh < prevLow
+        if (Number.isFinite(nextHigh) && Number.isFinite(prevLow) && nextHigh < prevLow) {
+          out.push({ type:'bear', low: nextHigh, high: prevLow, center: (nextHigh + prevLow)/2, index:i });
+        }
+      }
+      return out;
+    }
+    const fvg4h = detectFVG(normalized['4h']);
+    const fvg1h = detectFVG(normalized['1h']);
+    function zoneHasFvgOverlap(z) {
+      const has = (arr) => arr.some(g => !(z.high < g.low || z.low > g.high));
+      return has(fvg4h) || has(fvg1h);
+    }
+
+    // Score hot zones
+    function scoreHotZone(z) {
+      const a = Number.isFinite(atrRef) ? atrRef : (fallbackPrice*0.003);
+      const width = Math.max(1e-9, z.high - z.low);
+      const widthScore = Math.max(0, 1 - (width / (a*1.2))); // narrower zones get higher score
+      const structScore = (() => {
+        const mids = [(structureLow ?? null), (structureHigh ?? null)].filter(Number.isFinite);
+        if (!mids.length) return 0;
+        const mid = (z.low + z.high)/2;
+        const d = Math.min(...mids.map(s => Math.abs(mid - s)));
+        return Math.exp(-(d*d)/(2*Math.pow(a*1.5,2)));
+      })();
+      const fvgScore = zoneHasFvgOverlap(z) ? 0.25 : 0;
+      const inc0714 = z.includes0714 ? 0.25 : 0;
+      const incExt  = z.includesExt  ? 0.15 : 0;
+      return Math.max(0, Math.min(1, 0.35*widthScore + 0.25*structScore + inc0714 + incExt + fvgScore));
+    }
+    const scoredHot = hotZones.map(z => ({ ...z, score: scoreHotZone(z) }))
+                              .sort((a,b)=>b.score-a.score)
+                              .slice(0, 5);
+
     // ---------- Entry & TP/SL construction ----------
     // Reference timeframe for entry: prefer 4h structural last close
     const refTf = tfResults['4h']?.last?.close ? '4h'
@@ -684,7 +830,7 @@ module.exports = async function handler(req, res) {
     const structureLow = nearestSwingBelow(lastClose, lowsPool) ?? ((lastClose != null && atrRef != null) ? (lastClose - atrRef * 2) : null);
     const structureHigh = nearestSwingAbove(lastClose, highsPool) ?? ((lastClose != null && atrRef != null) ? (lastClose + atrRef * 2) : null);
 
-    // Build EMA21/EMA50 + Fib 0.5–0.618 confluence band on reference TF, sized by ATR
+    // Build EMA21/EMA50 + Fib golden pocket (0.618–0.65) confluence band on reference TF, sized by ATR
     function buildConfluenceBands() {
       if (lastClose == null) return null;
       const closesRef = (normalized[refTf] || []).map(c => toNum(c.close));
@@ -695,9 +841,23 @@ module.exports = async function handler(req, res) {
       const emaBand = (ema21v != null && ema50v != null)
         ? { low: Math.min(ema21v, ema50v), high: Math.max(ema21v, ema50v) }
         : null;
-      const fibBand = fib
-        ? { low: Math.min(fib.retr50, fib.retr618), high: Math.max(fib.retr50, fib.retr618) }
-        : null;
+      // Prefer golden pocket band from impulse if available
+      let fibBand = null;
+      if (fib && Number.isFinite(fib.low) && Number.isFinite(fib.high)) {
+        const low = fib.low, high = fib.high;
+        const gpA = low < high
+          ? { lo: low + 0.618 * (high - low), hi: low + 0.65 * (high - low) }
+          : { lo: high + 0.618 * (low - high), hi: high + 0.65 * (low - high) };
+        // normalize
+        const gpLow = Math.min(gpA.lo, gpA.hi);
+        const gpHigh = Math.max(gpA.lo, gpA.hi);
+        fibBand = { low: gpLow, high: gpHigh };
+        // optional 0.714 emphasis: lightly pull the band towards 0.714
+        const p0714 = low < high ? (low + 0.714 * (high - low)) : (high + 0.714 * (low - high));
+        const mid = (fibBand.low + fibBand.high) / 2;
+        const bias = (p0714 - mid) * 0.15; // small nudge
+        fibBand = { low: fibBand.low + bias, high: fibBand.high + bias };
+      }
       function overlap(a, b) {
         if (!a || !b) return null;
         const lo = Math.max(a.low, b.low);
@@ -819,7 +979,12 @@ module.exports = async function handler(req, res) {
         if (tick > 1) return 0.1;
         return tick;
       }
-      const tick = inferTickSize(refTf);
+      // Prefer provided tickSize (tickSize or priceTickSize) if valid
+      const providedTick = (() => {
+        const v = Number(tickSize ?? priceTickSize);
+        return (Number.isFinite(v) && v > 0) ? v : null;
+      })();
+      const tick = providedTick ?? inferTickSize(refTf);
       const side = final_signal.includes('BUY') ? 'LONG' : (final_signal.includes('SELL') ? 'SHORT' : 'FLAT');
       const floorToTick = (p) => (p == null ? p : Math.floor(p / tick) * tick);
       const ceilToTick  = (p) => (p == null ? p : Math.ceil(p / tick) * tick);
@@ -889,49 +1054,102 @@ module.exports = async function handler(req, res) {
     })();
     const entry_confidence = clamp01(0.55 * bandProx + 0.25 * structProx + 0.20 * stAlign);
 
-    // ---------- Compose final output (structure preserved) ----------
-    // Build reasons array like before but include flip_zone_confidence as an object entry so sheet can pick it up
-    const reasons = [];
-    for (const tf of Object.keys(tfResults)) {
-      const r = tfResults[tf];
-      if (r.reasons?.length) reasons.push({ timeframe: tf, score: r.score, reasons: r.reasons.slice(0, 6) });
-      else reasons.push({ timeframe: tf, score: r.score, reasons: [] });
+    // ---------- LTF (15m) confirmation near best hot zone ----------
+    function ltfConfirm(dir) {
+      const tf = tfResults['15m'];
+      if (!tf) return false;
+      const ema9 = tf.indicators?.ema9, ema21 = tf.indicators?.ema21;
+      const macd = tf.indicators?.macd, macdSig = tf.indicators?.macd_signal;
+      if (!Number.isFinite(ema9) || !Number.isFinite(ema21) || !Number.isFinite(macd) || !Number.isFinite(macdSig)) return false;
+      if (dir === 'UP') return (ema9 > ema21) && (macd > macdSig);
+      if (dir === 'DOWN') return (ema9 < ema21) && (macd < macdSig);
+      return false;
     }
-    // add flip zone object for downstream processing (sheet, LLM)
-    reasons.push({
-      flip_zone_confidence: flip_zone_confidence,
-      flip_zone_price: flip_zone_price,
-      flip_zone_description,
-      flip_zone_action: (typeof _flip_meta === 'object' ? _flip_meta.action : null),
-      flip_zone_direction_after: (typeof _flip_meta === 'object' ? _flip_meta.direction_after_flip : null),
-      flip_zone_range_low: (typeof _flip_meta === 'object' ? _flip_meta.low : null),
-      flip_zone_range_high: (typeof _flip_meta === 'object' ? _flip_meta.high : null)
-    });
-    if (Array.isArray(_flip_candidates) && _flip_candidates.length) {
-      reasons.push({ flip_zone_candidates: _flip_candidates });
-    }
-    // add continuous confidences (kept inside reasons to preserve schema)
-    reasons.push({
-      signal_confidence,
-      entry_confidence
-    });
+    const bestHot = scoredHot[0] || null;
+    const bestDir = bos?.dir || (final_signal.includes('BUY') ? 'UP' : (final_signal.includes('SELL') ? 'DOWN' : null));
+    const zoneReady = bestDir ? ltfConfirm(bestDir) : false;
+    // Position size factor
+    const sizeFactor = clamp01(
+      (bestHot?.score ?? 0) * 0.6 +
+      (entry_confidence) * 0.25 +
+      (zoneReady ? 0.15 : 0)
+    );
+    const sizeTier = sizeFactor >= 0.7 ? 'large' : (sizeFactor >= 0.4 ? 'normal' : 'small');
 
+    // ---------- Compose final output (structure preserved) ----------
+    // New concise, trader-focused schema
+    function mapBias(sig) {
+      if (sig.includes('STRONG BUY') || sig === 'BUY') return 'BUY';
+      if (sig.includes('STRONG SELL') || sig === 'SELL') return 'SELL';
+      return 'HOLD';
+    }
+    const bias = mapBias(final_signal);
+    const primaryZone = bestHot ? {
+      range_low: bestHot.low,
+      range_high: bestHot.high,
+      mid: (bestHot.low + bestHot.high)/2,
+      includes_0714: !!bestHot.includes0714,
+      includes_extension: !!bestHot.includesExt,
+      fvg_overlap: zoneHasFvgOverlap(bestHot),
+      score: Number((bestHot.score ?? 0).toFixed(3)),
+      action: (bestDir === 'UP') ? 'LONG' : (bestDir === 'DOWN' ? 'SHORT' : null),
+      ltf_ready: zoneReady
+    } : null;
+    const altZones = scoredHot.slice(1,3).map(z => ({
+      range_low: z.low, range_high: z.high, mid: (z.low+z.high)/2,
+      includes_0714: !!z.includes0714,
+      includes_extension: !!z.includesExt,
+      fvg_overlap: zoneHasFvgOverlap(z),
+      score: Number((z.score ?? 0).toFixed(3))
+    }));
+    const order_plan = {
+      side: primaryZone?.action ?? (final_signal.includes('BUY') ? 'LONG' : (final_signal.includes('SELL') ? 'SHORT' : 'FLAT')),
+      entry_range: { low: suggestions.level1.entry_range.low, high: suggestions.level1.entry_range.high },
+      entry: suggestions.level1.entry,
+      stop: suggestions.level1.stop_loss,
+      tp1: suggestions.level1.take_profit_1,
+      tp2: suggestions.level1.take_profit_2,
+      atr_used: suggestions.level1.atr_used
+    };
+    // Safeguards gate for live readiness
+    const pad = Number.isFinite(atrRef) ? atrRef * 0.2 : ((fallbackPrice ?? 0) * 0.0006);
+    const lp = fallbackPrice ?? null;
+    const zoneWithin = (primaryZone && lp != null)
+      ? (lp >= (primaryZone.range_low - pad) && lp <= (primaryZone.range_high + pad))
+      : false;
+    const ready =
+      (bias_confidence >= 0.6) &&
+      (entry_confidence >= 0.6) &&
+      !!(primaryZone && primaryZone.ltf_ready) &&
+      zoneWithin;
+    order_plan.ready = !!ready;
+    const structure = {
+      bos: bos ? { dir: bos.dir, broken_level: bos.brokenLevel ?? bos.brokenLevel, impulse_low: bos.low, impulse_high: bos.high } : null,
+      swing_support: structureLow ?? null,
+      swing_resistance: structureHigh ?? null
+    };
     const output = {
       symbol: symbol || null,
       exchangeSymbol: exchangeSymbol || null,
-      final_signal,
-      votesSummary: {
-        weighted: {
-          buyWeight,
-          sellWeight,
-          strongBuyWeight,
-          strongSellWeight,
-        },
-        byTf: Object.fromEntries(Object.keys(tfResults).map(k => [k, tfResults[k].signal]))
+      timestamp: normalized['4h']?.[normalized['4h'].length-1]?.openTime ?? null,
+      last_price: fallbackPrice ?? null,
+      tf_used: '4h',
+      bias,
+      bias_confidence: Number(signal_confidence.toFixed(3)),
+      entry_confidence: Number(entry_confidence.toFixed(3)),
+      position_size_factor: Number(sizeFactor.toFixed(3)),
+      position_size_tier: sizeTier,
+      primary_zone: primaryZone,
+      alt_zones: altZones,
+      order_plan,
+      flip_zone: {
+        price: flip_zone_price,
+        description: flip_zone_description,
+        action: (typeof _flip_meta === 'object' ? _flip_meta.action : null),
+        direction_after: (typeof _flip_meta === 'object' ? _flip_meta.direction_after_flip : null),
+        confidence: Number((flip_zone_confidence ?? 0).toFixed(3))
       },
-      suggestions,
-      reasons,
-      details: tfResults,
+      structure
     };
 
     console.log('[swing] final output signal=', final_signal);
