@@ -794,12 +794,16 @@ module.exports = async function handler(req, res) {
       const a = Number.isFinite(atrRef) ? atrRef : (fallbackPrice*0.003);
       const width = Math.max(1e-9, z.high - z.low);
       const widthScore = Math.max(0, 1 - (width / (a*1.2))); // narrower zones get higher score
+      // Structure proximity: distance to nearest 4h swing high/low price
       const structScore = (() => {
-        const mids = [(structureLow ?? null), (structureHigh ?? null)].filter(Number.isFinite);
-        if (!mids.length) return 0;
+        const highs = (swings4h?.swingHighs || []).map(s => Number(s.price)).filter(Number.isFinite);
+        const lows  = (swings4h?.swingLows  || []).map(s => Number(s.price)).filter(Number.isFinite);
+        const refList = highs.concat(lows);
+        if (!refList.length) return 0;
         const mid = (z.low + z.high)/2;
-        const d = Math.min(...mids.map(s => Math.abs(mid - s)));
-        return Math.exp(-(d*d)/(2*Math.pow(a*1.5,2)));
+        const d = Math.min(...refList.map(p => Math.abs(mid - p)));
+        const sigma = a * 1.5;
+        return Math.exp(-(d*d)/(2*sigma*sigma));
       })();
       const fvgScore = zoneHasFvgOverlap(z) ? 0.25 : 0;
       const inc0714 = z.includes0714 ? 0.25 : 0;
