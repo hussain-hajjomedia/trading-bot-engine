@@ -1107,7 +1107,13 @@ module.exports = async function handler(req, res) {
       score: Number((z.score ?? 0).toFixed(3))
     }));
     const order_plan = {
-      side: primaryZone?.action ?? (final_signal.includes('BUY') ? 'LONG' : (final_signal.includes('SELL') ? 'SHORT' : 'FLAT')),
+      side: (() => {
+        if (final_signal === 'STRONG BUY') return 'strong buy';
+        if (final_signal === 'BUY') return 'buy';
+        if (final_signal === 'STRONG SELL') return 'strong sell';
+        if (final_signal === 'SELL') return 'sell';
+        return 'hold';
+      })(),
       entry_range: { low: suggestions.level1.entry_range.low, high: suggestions.level1.entry_range.high },
       entry: suggestions.level1.entry,
       stop: suggestions.level1.stop_loss,
@@ -1132,6 +1138,20 @@ module.exports = async function handler(req, res) {
       swing_support: structureLow ?? null,
       swing_resistance: structureHigh ?? null
     };
+    // Confidence classification helpers and displays
+    function confidenceLabel(x) {
+      const v = Number(x);
+      if (!Number.isFinite(v)) return 'low';
+      if (v >= 0.70) return 'high';
+      if (v >= 0.40) return 'medium';
+      return 'low';
+    }
+    const bias_conf_label = confidenceLabel(signal_confidence);
+    const entry_conf_label = confidenceLabel(entry_confidence);
+    const flip_conf_label  = confidenceLabel(flip_zone_confidence ?? 0);
+    const bias_conf_pretty  = `${signal_confidence.toFixed(3)} (${bias_conf_label})`;
+    const entry_conf_pretty = `${entry_confidence.toFixed(3)} (${entry_conf_label})`;
+    const flip_conf_pretty  = `${(flip_zone_confidence ?? 0).toFixed(3)} (${flip_conf_label})`;
     const output = {
       symbol: symbol || null,
       exchangeSymbol: exchangeSymbol || null,
@@ -1141,6 +1161,10 @@ module.exports = async function handler(req, res) {
       bias,
       bias_confidence: Number(signal_confidence.toFixed(3)),
       entry_confidence: Number(entry_confidence.toFixed(3)),
+      bias_confidence_label: bias_conf_label,
+      entry_confidence_label: entry_conf_label,
+      bias_confidence_pretty: bias_conf_pretty,
+      entry_confidence_pretty: entry_conf_pretty,
       position_size_factor: Number(sizeFactor.toFixed(3)),
       position_size_tier: sizeTier,
       primary_zone: primaryZone,
@@ -1151,7 +1175,9 @@ module.exports = async function handler(req, res) {
         description: flip_zone_description,
         action: (typeof _flip_meta === 'object' ? _flip_meta.action : null),
         direction_after: (typeof _flip_meta === 'object' ? _flip_meta.direction_after_flip : null),
-        confidence: Number((flip_zone_confidence ?? 0).toFixed(3))
+        confidence: Number((flip_zone_confidence ?? 0).toFixed(3)),
+        confidence_label: flip_conf_label,
+        confidence_pretty: flip_conf_pretty
       },
       structure
     };
