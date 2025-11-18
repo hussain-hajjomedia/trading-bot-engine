@@ -1108,11 +1108,11 @@ module.exports = async function handler(req, res) {
     }));
     const order_plan = {
       side: (() => {
-        if (final_signal === 'STRONG BUY') return 'strong buy';
-        if (final_signal === 'BUY') return 'buy';
-        if (final_signal === 'STRONG SELL') return 'strong sell';
-        if (final_signal === 'SELL') return 'sell';
-        return 'hold';
+        if (final_signal === 'STRONG BUY') return 'STRONG BUY';
+        if (final_signal === 'BUY') return 'BUY';
+        if (final_signal === 'STRONG SELL') return 'STRONG SELL';
+        if (final_signal === 'SELL') return 'SELL';
+        return 'HOLD';
       })(),
       entry_range: { low: suggestions.level1.entry_range.low, high: suggestions.level1.entry_range.high },
       entry: suggestions.level1.entry,

@@ -887,6 +887,29 @@ export default async function handler(req, res) {
       bias: final_signal.includes('BUY') ? 'BUY' : (final_signal.includes('SELL') ? 'SELL' : 'HOLD'),
       bias_confidence: Number(signal_confidence.toFixed(3)),
       entry_confidence: Number(entry_confidence.toFixed(3)),
+      // Confidence labels and pretty strings
+      ...(() => {
+        function confidenceLabel(x) {
+          const v = Number(x);
+          if (!Number.isFinite(v)) return 'low';
+          if (v >= 0.70) return 'high';
+          if (v >= 0.40) return 'medium';
+          return 'low';
+        }
+        const bias_confidence_label = confidenceLabel(signal_confidence);
+        const entry_confidence_label = confidenceLabel(entry_confidence);
+        const flip_confidence_value = Number(((bestZone?.score ?? 0)).toFixed(3));
+        const flip_confidence_label = confidenceLabel(flip_confidence_value);
+        return {
+          bias_confidence_label,
+          entry_confidence_label,
+          bias_confidence_pretty: `${signal_confidence.toFixed(3)} (${bias_confidence_label})`,
+          entry_confidence_pretty: `${entry_confidence.toFixed(3)} (${entry_confidence_label})`,
+          // surface flip labels also at top-level for clients if needed
+          flip_confidence_label,
+          flip_confidence_pretty: `${flip_confidence_value.toFixed(3)} (${flip_confidence_label})`,
+        };
+      })(),
       position_size_factor: bestZone ? Number((Math.max(0, Math.min(1, (bestZone.score ?? 0)*0.6 + (confirm?0.2:0) + (prox*0.2)))).toFixed(3)) : null,
       position_size_tier: bestZone ? ((bestZone.score ?? 0) >= 0.7 ? 'large' : ((bestZone.score ?? 0) >= 0.4 ? 'normal' : 'small')) : null,
       primary_zone: bestZone ? {
@@ -908,7 +931,13 @@ export default async function handler(req, res) {
           }))
         : [],
       order_plan: bestZone && bands && bands.level1 ? {
-        side: final_signal.includes('BUY') ? 'LONG' : (final_signal.includes('SELL') ? 'SHORT' : 'FLAT'),
+        side: (() => {
+          if (final_signal === 'STRONG BUY') return 'STRONG BUY';
+          if (final_signal === 'BUY') return 'BUY';
+          if (final_signal === 'STRONG SELL') return 'STRONG SELL';
+          if (final_signal === 'SELL') return 'SELL';
+          return 'HOLD';
+        })(),
         entry_range: { low: suggestions.level1.entry_range.low, high: suggestions.level1.entry_range.high },
         entry: suggestions.level1.entry,
         stop: suggestions.level1.stop_loss,
@@ -917,7 +946,13 @@ export default async function handler(req, res) {
         atr_used: suggestions.level1.atr_used,
         ready
       } : {
-        side: final_signal.includes('BUY') ? 'LONG' : (final_signal.includes('SELL') ? 'SHORT' : 'FLAT'),
+        side: (() => {
+          if (final_signal === 'STRONG BUY') return 'STRONG BUY';
+          if (final_signal === 'BUY') return 'BUY';
+          if (final_signal === 'STRONG SELL') return 'STRONG SELL';
+          if (final_signal === 'SELL') return 'SELL';
+          return 'HOLD';
+        })(),
         entry_range: { low: null, high: null },
         entry: null, stop: null, tp1: null, tp2: null,
         atr_used: tfResults['15m']?.indicators?.atr14 ?? null,
@@ -928,8 +963,19 @@ export default async function handler(req, res) {
         description: bestZone.includes0714 ? 'includes 0.714 confluence' : (bestZone.includesExt ? 'includes extension confluence' : 'confluence zone'),
         action: final_signal.includes('BUY') ? 'LONG' : (final_signal.includes('SELL') ? 'SHORT' : null),
         direction_after: final_signal.includes('BUY') ? 'BUY' : (final_signal.includes('SELL') ? 'SELL' : null),
-        confidence: Number((bestZone.score ?? 0).toFixed(3))
-      } : { price: null, description: null, action: null, direction_after: null, confidence: 0 },
+        confidence: Number((bestZone.score ?? 0).toFixed(3)),
+        confidence_label: (() => {
+          const v = Number((bestZone?.score ?? 0).toFixed(3));
+          if (v >= 0.70) return 'high';
+          if (v >= 0.40) return 'medium';
+          return 'low';
+        })(),
+        confidence_pretty: (() => {
+          const v = Number((bestZone?.score ?? 0).toFixed(3));
+          const lbl = (v >= 0.70) ? 'high' : (v >= 0.40 ? 'medium' : 'low');
+          return `${v.toFixed(3)} (${lbl})`;
+        })()
+      } : { price: null, description: null, action: null, direction_after: null, confidence: 0, confidence_label: 'low', confidence_pretty: '0.000 (low)' },
       structure: {
         bos: bos15 ? { dir: bos15.dir, broken_level: null, impulse_low: bos15.low, impulse_high: bos15.high } : null,
         swing_support: (() => { const e = lastPrice; if (!e) return null; const lows = swings15?.swingLows || []; const arr = lows.filter(x=>x.price < e).map(x=>x.price); return arr.length? Math.max(...arr): null; })(),
