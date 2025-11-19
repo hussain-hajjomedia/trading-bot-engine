@@ -520,7 +520,13 @@ export default async function handler(req, res) {
     else final_signal = 'HOLD';
 
     // ---------- ATR reference (15m only) ----------
-    const lastClose15 = tfResults['15m']?.last?.close ?? null;
+    const lastClose15 = (() => {
+      const tfLast = tfResults['15m']?.last?.close;
+      if (Number.isFinite(tfLast)) return tfLast;
+      const arr = normalized['15m'];
+      const c = Array.isArray(arr) && arr.length ? Number(arr[arr.length - 1]?.close) : null;
+      return Number.isFinite(c) ? c : null;
+    })();
     const atrRef = tfResults['15m']?.indicators?.atr14 ?? tfResults['15m']?.indicators?.atr7 ?? (lastClose15 != null ? lastClose15 * 0.003 : 1);
 
     console.log('[indicators] atrRef', atrRef);
@@ -1008,7 +1014,11 @@ export default async function handler(req, res) {
       return false;
     }
     // Build a primary zone
-    const lastPrice = lastClose15 ?? tfResults['15m']?.last?.close ?? null;
+    const lastPrice = (() => {
+      if (Number.isFinite(lastClose15)) return lastClose15;
+      const tfLast = tfResults['15m']?.last?.close;
+      return Number.isFinite(tfLast) ? tfLast : null;
+    })();
     const ZONE_MIN_SCORE = 0.55;
     let bestZone = (Array.isArray(scoredWithFvg) && scoredWithFvg.length)
       ? (scoredWithFvg.find(z => (z.score ?? 0) >= ZONE_MIN_SCORE) || null)
@@ -1631,7 +1641,16 @@ export default async function handler(req, res) {
         confirm: !!confirm,
         in_zone: !!inZone,
         near_trigger: !!nearTrigger,
-        entry_mode: entryMode
+        entry_mode: entryMode,
+        ready_final: !!readyFinal,
+        regime: regimeContext,
+        of_nudge: typeof of_nudge === 'number' ? Number(of_nudge.toFixed(3)) : 0,
+        wf_params: chosenCalib || null,
+        adaptive_params_used: {
+          pad: Number.isFinite(pad) ? Number(pad.toFixed(8)) : null,
+          near_zone_half_factor: Number.isFinite(nearZoneHalfFactor) ? Number(nearZoneHalfFactor.toFixed(3)) : null,
+          trigger_prox_atr: Number.isFinite(TRIGGER_PROX_ATR) ? Number(TRIGGER_PROX_ATR.toFixed(3)) : null
+        }
       }
     };
 
