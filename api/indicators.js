@@ -1056,17 +1056,27 @@ module.exports = async function handler(req, res) {
       if (final_signal.includes('SELL')) return lastClose < stv ? 1.0 : 0.2;
       return 0.5;
     })();
-    const entry_confidence = clamp01(0.55 * bandProx + 0.25 * structProx + 0.20 * stAlign);
+    let entry_confidence = clamp01(0.55 * bandProx + 0.25 * structProx + 0.20 * stAlign);
+    // Balanced tweak: MACD acts as a small positive boost, not a hard gate
+    const macdBoostAligned = (() => {
+      const tf15 = tfResults['15m'];
+      if (!tf15) return false;
+      const macd = tf15.indicators?.macd, macdSig = tf15.indicators?.macd_signal;
+      if (!Number.isFinite(macd) || !Number.isFinite(macdSig)) return false;
+      if (final_signal.includes('BUY')) return macd > macdSig;
+      if (final_signal.includes('SELL')) return macd < macdSig;
+      return false;
+    })();
+    if (macdBoostAligned) entry_confidence = clamp01(entry_confidence + 0.05);
 
     // ---------- LTF (15m) confirmation near best hot zone ----------
     function ltfConfirm(dir) {
       const tf = tfResults['15m'];
       if (!tf) return false;
       const ema9 = tf.indicators?.ema9, ema21 = tf.indicators?.ema21;
-      const macd = tf.indicators?.macd, macdSig = tf.indicators?.macd_signal;
-      if (!Number.isFinite(ema9) || !Number.isFinite(ema21) || !Number.isFinite(macd) || !Number.isFinite(macdSig)) return false;
-      if (dir === 'UP') return (ema9 > ema21) && (macd > macdSig);
-      if (dir === 'DOWN') return (ema9 < ema21) && (macd < macdSig);
+      if (!Number.isFinite(ema9) || !Number.isFinite(ema21)) return false;
+      if (dir === 'UP') return (ema9 > ema21);
+      if (dir === 'DOWN') return (ema9 < ema21);
       return false;
     }
     const bestHot = scoredHot[0] || null;
@@ -1122,16 +1132,36 @@ module.exports = async function handler(req, res) {
       atr_used: suggestions.level1.atr_used
     };
     // Safeguards gate for live readiness
-    const pad = Number.isFinite(atrRef) ? atrRef * 0.2 : ((fallbackPrice ?? 0) * 0.0006);
+    const pad = Number.isFinite(atrRef) ? atrRef * 0.25 : ((fallbackPrice ?? 0) * 0.0006);
     const lp = fallbackPrice ?? null;
     const zoneWithin = (primaryZone && lp != null)
       ? (lp >= (primaryZone.range_low - pad) && lp <= (primaryZone.range_high + pad))
       : false;
+    // Balanced: allow near-zone if within 0.5*pad and moving toward band mid
+    const nearZone = (() => {
+      if (!primaryZone || lp == null) return false;
+      if (zoneWithin) return false;
+      const halfPad = pad * 0.5;
+      const lower = primaryZone.range_low - halfPad;
+      const upper = primaryZone.range_high + halfPad;
+      if (!(lp >= lower && lp <= upper)) return false;
+      const mid = (primaryZone.range_low + primaryZone.range_high) / 2;
+      const prev =
+        normalized['4h']?.[normalized['4h'].length - 2]?.close ??
+        normalized['1h']?.[normalized['1h'].length - 2]?.close ??
+        normalized['15m']?.[normalized['15m'].length - 2]?.close ?? null;
+      if (!Number.isFinite(prev)) return true;
+      const dNow = Math.abs(lp - mid);
+      const dPrev = Math.abs(prev - mid);
+      return dNow < dPrev;
+    })();
+    const bypassLtf = (signal_confidence >= 0.75) && (entry_confidence >= 0.70);
+    const ltfOk = bypassLtf ? true : !!(primaryZone && primaryZone.ltf_ready);
     const ready =
       (signal_confidence >= 0.6) &&
       (entry_confidence >= 0.6) &&
-      !!(primaryZone && primaryZone.ltf_ready) &&
-      zoneWithin;
+      ltfOk &&
+      (zoneWithin || nearZone);
     order_plan.ready = !!ready;
     const structure = {
       bos: bos ? { dir: bos.dir, broken_level: bos.brokenLevel ?? bos.brokenLevel, impulse_low: bos.low, impulse_high: bos.high } : null,

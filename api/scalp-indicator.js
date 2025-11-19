@@ -861,10 +861,9 @@ export default async function handler(req, res) {
       const tf = tfResults['15m'];
       if (!tf) return false;
       const ema9 = tf.indicators?.ema9, ema21 = tf.indicators?.ema21;
-      const macd = tf.indicators?.macd, macdSig = tf.indicators?.macd_signal;
-      if (!Number.isFinite(ema9) || !Number.isFinite(ema21) || !Number.isFinite(macd) || !Number.isFinite(macdSig)) return false;
-      if (dir === 'UP') return (ema9 > ema21) && (macd > macdSig);
-      if (dir === 'DOWN') return (ema9 < ema21) && (macd < macdSig);
+      if (!Number.isFinite(ema9) || !Number.isFinite(ema21)) return false;
+      if (dir === 'UP') return (ema9 > ema21);
+      if (dir === 'DOWN') return (ema9 < ema21);
       return false;
     }
     // Build a primary zone
@@ -874,12 +873,26 @@ export default async function handler(req, res) {
       ? (scoredWithFvg.find(z => (z.score ?? 0) >= ZONE_MIN_SCORE) || null)
       : null;
     const zoneMid = bestZone ? ((bestZone.low + bestZone.high)/2) : null;
-    const pad = Number.isFinite(atrRef) ? atrRef * 0.15 : ((lastPrice ?? 0) * 0.0005);
+    const pad = Number.isFinite(atrRef) ? atrRef * 0.25 : ((lastPrice ?? 0) * 0.0005);
     const inZone = (bestZone && lastPrice != null)
       ? (lastPrice >= (bestZone.low - pad) && lastPrice <= (bestZone.high + pad))
       : false;
     const dirMap = final_signal.includes('BUY') ? 'UP' : (final_signal.includes('SELL') ? 'DOWN' : null);
     const confirm = dirMap ? ltfConfirm(dirMap) : false;
+    const nearZone = (() => {
+      if (!bestZone || lastPrice == null) return false;
+      if (inZone) return false;
+      const halfPad = pad * 0.5;
+      const lower = bestZone.low - halfPad;
+      const upper = bestZone.high + halfPad;
+      if (!(lastPrice >= lower && lastPrice <= upper)) return false;
+      const mid = (bestZone.low + bestZone.high) / 2;
+      const prev = normalized['15m']?.[normalized['15m'].length - 2]?.close ?? null;
+      if (!Number.isFinite(prev)) return true;
+      const dNow = Math.abs(lastPrice - mid);
+      const dPrev = Math.abs(prev - mid);
+      return dNow < dPrev;
+    })();
     // Pullback validity (time + distance) and breakout fallback
     function lastZoneTouchIdx(candles, zoneLow, zoneHigh, lookbackCandles = 12) {
       if (!Array.isArray(candles) || !Number.isFinite(zoneLow) || !Number.isFinite(zoneHigh)) return null;
@@ -944,7 +957,7 @@ export default async function handler(req, res) {
       return null;
     }
     const breakoutTrigger = pickBreakoutTrigger(dirMap, lastPrice ?? -Infinity, impExt);
-    const TRIGGER_PROX_ATR = 0.25; // require current price within 0.25 ATR of trigger
+    const TRIGGER_PROX_ATR = 0.40; // Balanced proximity to breakout trigger
     const nearTrigger = (Number.isFinite(breakoutTrigger) && Number.isFinite(lastPrice) && Number.isFinite(atrRef))
       ? (Math.abs(lastPrice - breakoutTrigger) <= (atrRef * TRIGGER_PROX_ATR))
       : false;
@@ -952,14 +965,25 @@ export default async function handler(req, res) {
     function clamp01(x){ return Math.max(0, Math.min(1, x)); }
     const dist = (bestZone && lastPrice != null) ? Math.abs(zoneMid - lastPrice) : null;
     const prox = dist == null ? 0 : Math.exp(- (dist*dist) / (2 * Math.pow((atrRef ?? (lastPrice*0.003)) * 0.6, 2)));
-    const entry_confidence = bestZone ? clamp01(0.6 * prox + 0.25 * (bestZone.score ?? 0) + 0.15 * (confirm ? 1 : 0)) : 0;
+    let entry_confidence = bestZone ? clamp01(0.6 * prox + 0.25 * (bestZone.score ?? 0) + 0.15 * (confirm ? 1 : 0)) : 0;
+    const macdBoostAligned = (() => {
+      const tf = tfResults['15m'];
+      if (!tf || !dirMap) return false;
+      const macd = tf.indicators?.macd, macdSig = tf.indicators?.macd_signal;
+      if (!Number.isFinite(macd) || !Number.isFinite(macdSig)) return false;
+      if (dirMap === 'UP') return macd > macdSig;
+      if (dirMap === 'DOWN') return macd < macdSig;
+      return false;
+    })();
+    if (macdBoostAligned) entry_confidence = clamp01(entry_confidence + 0.05);
     const signal_confidence = clamp01(Math.abs((tfResults['1h']?.score ?? 0)) / 40);
     // Hybrid readiness: pullback mode uses inZone; breakout mode uses nearTrigger
     const entryMode = (pullbackValid ? 'PULLBACK' : 'BREAKOUT');
+    const bypassLtf = (signal_confidence >= 0.75) && (entry_confidence >= 0.70);
     const ready = (signal_confidence >= 0.6) &&
                   (entry_confidence >= 0.6) &&
-                  confirm &&
-                  (entryMode === 'PULLBACK' ? inZone : nearTrigger);
+                  ((bypassLtf) || confirm) &&
+                  (entryMode === 'PULLBACK' ? (inZone || nearZone) : nearTrigger);
 
     // ---------- Output (scalp, swing-style concise) ----------
     const output = {
