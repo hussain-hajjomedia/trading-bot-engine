@@ -1,5 +1,7 @@
 // api/indicators-swing.js
 // Full swing indicator engine — copy/paste ready
+// --------- Lightweight in-memory store (cooldown; best-effort in serverless) ---------
+const COOLDOWN_STATE = new Map();
 module.exports = async function handler(req, res) {
   if (req.method !== 'POST') {
     res.status(405).json({ error: 'Only POST allowed' });
@@ -9,6 +11,21 @@ module.exports = async function handler(req, res) {
   try {
     const payload = req.body || {};
     let { symbol, exchangeSymbol, kline_15m, kline_1h, kline_4h, kline_1d, tickSize, priceTickSize, stepSize } = payload;
+
+    // -------- Feature Flags and cooldown client-assist --------
+    const inputFlags = (payload && typeof payload.flags === 'object') ? payload.flags : {};
+    const flags = {
+      instrumentation: !!inputFlags.instrumentation,
+      ltf_stability:   !!inputFlags.ltf_stability,
+      adaptive_proximity: !!inputFlags.adaptive_proximity,
+      regime_filter:      !!inputFlags.regime_filter,
+      zone_quality:       !!inputFlags.zone_quality,
+      tp_sl_refine:       !!inputFlags.tp_sl_refine,
+      cooldown:           !!inputFlags.cooldown,
+      wf_calibrate:       !!inputFlags.wf_calibrate,
+    };
+    const clientLastReadyIndex = Number.isFinite(Number(payload?.lastReadyIndex)) ? Number(payload.lastReadyIndex) : null;
+    const clientLastReadyTime  = Number.isFinite(Number(payload?.lastReadyTime))  ? Number(payload.lastReadyTime)  : null;
 
     // ---------- Utilities ----------
     function tryParseMaybeJson(input) {
@@ -944,6 +961,17 @@ module.exports = async function handler(req, res) {
           tp2 = entry + atrRef * (m * 1.8);
         }
       }
+      // Regime-based TP/SL refinement (swing)
+      if (flags.tp_sl_refine && regimeContext && regimeContext.score != null && atrRef != null && entry != null) {
+        if (regimeContext.regime === 'trend') {
+          tp2 = Number.isFinite(tp2) ? (tp2 + atrRef * 0.25 * (final_signal.includes('BUY') ? 1 : -1)) : tp2;
+        } else if (regimeContext.regime === 'chop') {
+          tp2 = Number.isFinite(tp2) ? (tp2 - atrRef * 0.2 * (final_signal.includes('BUY') ? 1 : -1)) : tp2;
+          // tighten SL slightly toward entry
+          if (final_signal.includes('BUY')) sl = Number.isFinite(sl) ? Math.min(sl + atrRef * 0.05, entry) : sl;
+          else if (final_signal.includes('SELL')) sl = Number.isFinite(sl) ? Math.max(sl - atrRef * 0.05, entry) : sl;
+        }
+      }
 
       // safety clamps: do not propose SL farther than 8% and TP farther than 12% (swing safety)
       function clamp(val, base, pct) {
@@ -1068,8 +1096,36 @@ module.exports = async function handler(req, res) {
       return false;
     })();
     if (macdBoostAligned) entry_confidence = clamp01(entry_confidence + 0.05);
+    // Zone quality bonus (4h/1h sweeps and wicks near best hot zone)
+    if (flags.zone_quality && bestHot) {
+      let bonus = 0;
+      const mid = (bestHot.low + bestHot.high) / 2;
+      const a = Number.isFinite(atrRef) ? atrRef : ((fallbackPrice ?? 0) * 0.003);
+      const eps = a * 0.2;
+      function addBonusFrom(arr) {
+        let eq=0, wick=0;
+        for (let k = Math.max(0, arr.length - 40); k < arr.length; k++) {
+          const c = arr[k];
+          const h = toNum(c?.high), l = toNum(c?.low), o = toNum(c?.open), cl = toNum(c?.close);
+          if (!Number.isFinite(h)||!Number.isFinite(l)||!Number.isFinite(o)||!Number.isFinite(cl)) continue;
+          const nearHigh = Math.abs(h - mid) <= eps || Math.abs(h - bestHot.high) <= eps;
+          const nearLow  = Math.abs(l - mid) <= eps || Math.abs(l - bestHot.low)  <= eps;
+          if (nearHigh || nearLow) eq++;
+          const body = Math.abs(cl - o);
+          const upperW = h - Math.max(cl, o);
+          const lowerW = Math.min(cl, o) - l;
+          if ((nearHigh && upperW > body * 1.2) || (nearLow && lowerW > body * 1.2)) wick++;
+        }
+        return {eq, wick};
+      }
+      const s4 = addBonusFrom(normalized['4h'] || []);
+      const s1 = addBonusFrom(normalized['1h'] || []);
+      if ((s4.eq + s1.eq) >= 2) bonus += 0.02;
+      if ((s4.wick + s1.wick) >= 2) bonus += 0.02;
+      entry_confidence = clamp01(entry_confidence + Math.min(0.05, bonus));
+    }
 
-    // ---------- LTF (15m) confirmation near best hot zone ----------
+    // ---------- LTF confirmation near best hot zone ----------
     function ltfConfirm(dir) {
       const tf = tfResults['15m'];
       if (!tf) return false;
@@ -1079,9 +1135,35 @@ module.exports = async function handler(req, res) {
       if (dir === 'DOWN') return (ema9 < ema21);
       return false;
     }
+    function ltfConfirm1hStable(dir) {
+      try {
+        const arr = normalized['1h'] || [];
+        if (arr.length < 5) return false;
+        const closes = arr.map(c => toNum(c.close));
+        const ema9A = ema(closes, 9);
+        const ema21A = ema(closes, 21);
+        const macdObj = macd(closes);
+        const i = closes.length - 1;
+        const lagIdx = i - 1;
+        if (lagIdx < 0) return false;
+        const m = macdObj.macdLine[lagIdx];
+        const s = macdObj.signalLine[lagIdx];
+        const macdAligned = (Number.isFinite(m) && Number.isFinite(s)) ? ((dir === 'UP') ? (m > s) : (m < s)) : false;
+        const required = macdAligned ? 1 : 2;
+        const start = lagIdx - required + 1;
+        if (start < 0) return false;
+        for (let k=start; k<=lagIdx; k++) {
+          const e9 = ema9A[k], e21 = ema21A[k];
+          if (!Number.isFinite(e9) || !Number.isFinite(e21)) return false;
+          if (dir === 'UP' && !(e9 > e21)) return false;
+          if (dir === 'DOWN' && !(e9 < e21)) return false;
+        }
+        return true;
+      } catch { return false; }
+    }
     const bestHot = scoredHot[0] || null;
     const bestDir = bos?.dir || (final_signal.includes('BUY') ? 'UP' : (final_signal.includes('SELL') ? 'DOWN' : null));
-    const zoneReady = bestDir ? ltfConfirm(bestDir) : false;
+    const zoneReady = bestDir ? (flags.ltf_stability ? ltfConfirm1hStable(bestDir) : ltfConfirm(bestDir)) : false;
     // Position size factor
     const sizeFactor = clamp01(
       (bestHot?.score ?? 0) * 0.6 +
@@ -1089,6 +1171,83 @@ module.exports = async function handler(req, res) {
       (zoneReady ? 0.15 : 0)
     );
     const sizeTier = sizeFactor >= 0.7 ? 'large' : (sizeFactor >= 0.4 ? 'normal' : 'small');
+
+    // -------- Phase 2: Adaptive proximity (4h ATR percentile buckets) --------
+    const arr4h = normalized['4h'] || [];
+    const closes4h = arr4h.map(c=>toNum(c.close));
+    const highs4h  = arr4h.map(c=>toNum(c.high));
+    const lows4h   = arr4h.map(c=>toNum(c.low));
+    const atr4hArr = atr(highs4h, lows4h, closes4h, 14);
+    let hvpPercentile4h = null;
+    if (flags.adaptive_proximity && atr4hArr.filter(Number.isFinite).length >= 40) {
+      const sample = atr4hArr.slice(-120).filter(Number.isFinite);
+      if (sample.length >= 20) {
+        const lastAtr = sample[sample.length - 1];
+        const sorted = [...sample].sort((a,b)=>a-b);
+        const idx = sorted.findIndex(v => v >= lastAtr);
+        const pct = idx < 0 ? 1 : (idx / Math.max(1, sorted.length - 1));
+        hvpPercentile4h = Math.max(0, Math.min(1, pct));
+      }
+    }
+    const atrBucket = (hvpPercentile4h == null) ? 'medium' : (hvpPercentile4h <= 0.33 ? 'low' : (hvpPercentile4h <= 0.66 ? 'medium' : 'high'));
+    let padMul = flags.adaptive_proximity ? (atrBucket === 'low' ? 0.20 : (atrBucket === 'medium' ? 0.25 : 0.35)) : 0.25;
+    let nearHalfMul = flags.adaptive_proximity ? (atrBucket === 'low' ? 0.40 : (atrBucket === 'medium' ? 0.50 : 0.60)) : 0.50;
+
+    // -------- Regime filter (4h EMA21 slope + ATR percentile + BB width expansion) --------
+    let regimeContext = { score: null, regime: 'neutral' };
+    if (flags.regime_filter || flags.tp_sl_refine) {
+      try {
+        if (closes4h.length >= 40) {
+          const ema21_4h = ema(closes4h, 21);
+          const i = closes4h.length - 1;
+          const lb = Math.max(0, i - 10);
+          const price4h = closes4h[i];
+          const slope = (Number.isFinite(ema21_4h[i]) && Number.isFinite(ema21_4h[lb]) && Number.isFinite(price4h))
+            ? ((ema21_4h[i] - ema21_4h[lb]) / Math.max(1e-9, price4h))
+            : 0;
+          const slopeScore = Math.max(0, Math.min(1, Math.abs(slope) / 0.004));
+          // BB width proxy via stddev (20)
+          const win = 20;
+          let widths = [];
+          for (let k = Math.max(0, closes4h.length - 120); k < closes4h.length; k++) {
+            const s = Math.max(0, k - win + 1);
+            const seg = closes4h.slice(s, k+1).filter(Number.isFinite);
+            if (seg.length >= 5) {
+              const mean = seg.reduce((a,b)=>a+b,0)/seg.length;
+              const variance = seg.reduce((a,b)=>a + Math.pow(b-mean,2),0)/seg.length;
+              const std = Math.sqrt(variance);
+              widths.push(2*std);
+            }
+          }
+          const curW = widths[widths.length-1] ?? 0;
+          const medW = widths.length ? [...widths].sort((a,b)=>a-b)[Math.floor(widths.length/2)] : 0;
+          const widthRatio = (Number.isFinite(curW) && Number.isFinite(medW) && medW > 0) ? (curW/medW) : 1;
+          const widthScore = Math.max(0, Math.min(1, (widthRatio - 0.8) / 0.7));
+          let score = Math.max(0, Math.min(1, (slopeScore*0.5 + (hvpPercentile4h ?? 0.5)*0.25 + widthScore*0.25)));
+          // RSI21 slope agreement on 4h
+          const rsi21_4h = rsiWilder(closes4h, 21);
+          const rlb = Math.max(0, i - 10);
+          const rsiSlope = (Number.isFinite(rsi21_4h[i]) && Number.isFinite(rsi21_4h[rlb])) ? (rsi21_4h[i] - rsi21_4h[rlb]) : 0;
+          const rsiAgree = (rsiSlope > 0 && slope > 0) || (rsiSlope < 0 && slope < 0);
+          if (rsiAgree && Math.abs(rsiSlope) >= 3) score = Math.min(1, score + 0.1);
+          // Alternation penalty during expansion
+          let alternations = 0, dir = null;
+          for (let k = Math.max(1, i-6); k <= i; k++) {
+            const d = closes4h[k] - closes4h[k-1];
+            const sgn = d >= 0 ? 1 : -1;
+            if (dir != null && sgn !== dir) alternations++;
+            dir = sgn;
+          }
+          if (widthRatio > 1.0 && alternations >= 3) score = Math.max(0, score - 0.1);
+          regimeContext = { score, regime: (score >= 0.6 ? 'trend' : (score <= 0.4 ? 'chop' : 'neutral')) };
+          // Bias pad slightly
+          if (flags.regime_filter) {
+            if (regimeContext.regime === 'trend') padMul *= 0.95;
+            else if (regimeContext.regime === 'chop') padMul *= 1.08;
+          }
+        }
+      } catch {}
+    }
 
     // ---------- Compose final output (structure preserved) ----------
     // New concise, trader-focused schema
@@ -1132,7 +1291,7 @@ module.exports = async function handler(req, res) {
       atr_used: suggestions.level1.atr_used
     };
     // Safeguards gate for live readiness
-    const pad = Number.isFinite(atrRef) ? atrRef * 0.25 : ((fallbackPrice ?? 0) * 0.0006);
+    const pad = Number.isFinite(atrRef) ? atrRef * padMul : ((fallbackPrice ?? 0) * 0.0006);
     const lp = fallbackPrice ?? null;
     const zoneWithin = (primaryZone && lp != null)
       ? (lp >= (primaryZone.range_low - pad) && lp <= (primaryZone.range_high + pad))
@@ -1141,7 +1300,7 @@ module.exports = async function handler(req, res) {
     const nearZone = (() => {
       if (!primaryZone || lp == null) return false;
       if (zoneWithin) return false;
-      const halfPad = pad * 0.5;
+      const halfPad = pad * (nearHalfMul ?? 0.5);
       const lower = primaryZone.range_low - halfPad;
       const upper = primaryZone.range_high + halfPad;
       if (!(lp >= lower && lp <= upper)) return false;
@@ -1162,7 +1321,23 @@ module.exports = async function handler(req, res) {
       (entry_confidence >= 0.6) &&
       ltfOk &&
       (zoneWithin || nearZone);
-    order_plan.ready = !!ready;
+    let readyFinal = !!ready;
+    // Cooldown (longer horizon)
+    if (flags.cooldown && symbol) {
+      const lastIdx4h = normalized['4h']?.length ? (normalized['4h'].length - 1) : null;
+      const lastTs4h = normalized['4h']?.[lastIdx4h]?.openTime ?? Date.now();
+      const key = `${symbol}|${bias}`;
+      const state = COOLDOWN_STATE.get(key);
+      const prevIdx = Number.isInteger(clientLastReadyIndex) ? clientLastReadyIndex : (Number.isInteger(state?.idx) ? state.idx : null);
+      const prevTs = Number.isFinite(clientLastReadyTime) ? clientLastReadyTime : (Number.isFinite(state?.ts) ? state.ts : null);
+      const M = 2; // 2x4h bars
+      const T = 8 * 60 * 60 * 1000; // 8 hours
+      const tooSoonByBars = Number.isInteger(prevIdx) && Number.isInteger(lastIdx4h) && ((lastIdx4h - prevIdx) < M);
+      const tooSoonByTime = Number.isFinite(prevTs) && ((Number(lastTs4h) - prevTs) < T);
+      if (readyFinal && (tooSoonByBars || tooSoonByTime)) readyFinal = false;
+      if (readyFinal && Number.isInteger(lastIdx4h)) COOLDOWN_STATE.set(key, { idx: lastIdx4h, ts: Number(lastTs4h) });
+    }
+    order_plan.ready = !!readyFinal;
     const structure = {
       bos: bos ? { dir: bos.dir, broken_level: bos.brokenLevel ?? bos.brokenLevel, impulse_low: bos.low, impulse_high: bos.high } : null,
       swing_support: structureLow ?? null,
@@ -1212,6 +1387,22 @@ module.exports = async function handler(req, res) {
       structure
     };
 
+    // Telemetry sampling (when instrumentation)
+    if (flags.instrumentation && Math.random() < 0.2) {
+      console.log('[swing][instrumentation] readiness', {
+        symbol,
+        bias,
+        signal_confidence: Number(signal_confidence.toFixed(3)),
+        entry_confidence: Number(entry_confidence.toFixed(3)),
+        ltf_ok: !!ltfOk,
+        zone_within: !!zoneWithin,
+        near_zone: !!nearZone,
+        ready: !!readyFinal,
+        padMul,
+        nearHalfMul,
+        regime: regimeContext
+      });
+    }
     console.log('[swing] final output signal=', final_signal);
     return res.status(200).json(output);
 
