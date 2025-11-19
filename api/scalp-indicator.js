@@ -869,13 +869,86 @@ export default async function handler(req, res) {
       : false;
     const dirMap = final_signal.includes('BUY') ? 'UP' : (final_signal.includes('SELL') ? 'DOWN' : null);
     const confirm = dirMap ? ltfConfirm(dirMap) : false;
+    // Pullback validity (time + distance) and breakout fallback
+    function lastZoneTouchIdx(candles, zoneLow, zoneHigh, lookbackCandles = 12) {
+      if (!Array.isArray(candles) || !Number.isFinite(zoneLow) || !Number.isFinite(zoneHigh)) return null;
+      const lo = Math.min(zoneLow, zoneHigh), hi = Math.max(zoneLow, zoneHigh);
+      const start = Math.max(0, candles.length - 1 - lookbackCandles);
+      for (let i = candles.length - 1; i >= start; i--) {
+        const c = candles[i];
+        const ch = toNum(c?.high), cl = toNum(c?.low);
+        if (Number.isFinite(ch) && Number.isFinite(cl) && !(hi < cl || lo > ch)) return i;
+      }
+      return null;
+    }
+    const TOUCH_MAX_CANDLES = 3;  // invalid if last touch older than this on 15m
+    const lastTouchIdx = (bestZone && normalized['15m'] && normalized['15m'].length)
+      ? lastZoneTouchIdx(normalized['15m'], bestZone.low, bestZone.high, 12)
+      : null;
+    const lastIdx = (normalized['15m']?.length ?? 0) - 1;
+    const touchAgeCandles = (lastTouchIdx != null && lastIdx >= 0) ? (lastIdx - lastTouchIdx) : null;
+    function distanceFromZone(price, zLow, zHigh) {
+      if (!Number.isFinite(price) || !Number.isFinite(zLow) || !Number.isFinite(zHigh)) return Infinity;
+      if (price >= zLow && price <= zHigh) return 0;
+      if (price < zLow) return (zLow - price);
+      return (price - zHigh);
+    }
+    const distToZoneAbs = (bestZone && Number.isFinite(lastPrice)) ? distanceFromZone(lastPrice, bestZone.low, bestZone.high) : Infinity;
+    const atrHalf = Number.isFinite(atrRef) ? (atrRef * 0.5) : Infinity;
+    const pullbackInvalidByTime = (touchAgeCandles != null) ? (touchAgeCandles > TOUCH_MAX_CANDLES) : false;
+    const pullbackInvalidByDistance = distToZoneAbs > atrHalf;
+    const pullbackValid = !!bestZone && !pullbackInvalidByTime && !pullbackInvalidByDistance;
+    // Breakout triggers from impulse extensions (forward-only)
+    function impulseExtensions(imp) {
+      if (!imp || imp.low == null || imp.high == null) return null;
+      const low = imp.low, high = imp.high;
+      const leg = Math.abs(high - low);
+      if (!Number.isFinite(leg) || leg === 0) return null;
+      if (imp.dir === 'UP') {
+        return {
+          dir: 'UP',
+          ext1272: low + 1.272 * leg,
+          ext1382: low + 1.382 * leg,
+          ext1618: low + 1.618 * leg
+        };
+      } else {
+        return {
+          dir: 'DOWN',
+          ext1272: high - 1.272 * leg,
+          ext1382: high - 1.382 * leg,
+          ext1618: high - 1.618 * leg
+        };
+      }
+    }
+    const impExt = impulseExtensions(impulse);
+    function pickBreakoutTrigger(direction, price, ext) {
+      if (!direction || !Number.isFinite(price) || !ext) return null;
+      const levelsUp = [ext.ext1272, ext.ext1382, ext.ext1618].filter(Number.isFinite).sort((a,b)=>a-b);
+      const levelsDown = [ext.ext1618, ext.ext1382, ext.ext1272].filter(Number.isFinite).sort((a,b)=>b-a);
+      if (direction === 'UP') {
+        for (const lv of levelsUp) if (lv > price) return lv;
+      } else if (direction === 'DOWN') {
+        for (const lv of levelsDown) if (lv < price) return lv;
+      }
+      return null;
+    }
+    const breakoutTrigger = pickBreakoutTrigger(dirMap, lastPrice ?? -Infinity, impExt);
+    const TRIGGER_PROX_ATR = 0.25; // require current price within 0.25 ATR of trigger
+    const nearTrigger = (Number.isFinite(breakoutTrigger) && Number.isFinite(lastPrice) && Number.isFinite(atrRef))
+      ? (Math.abs(lastPrice - breakoutTrigger) <= (atrRef * TRIGGER_PROX_ATR))
+      : false;
     // Confidences
     function clamp01(x){ return Math.max(0, Math.min(1, x)); }
     const dist = (bestZone && lastPrice != null) ? Math.abs(zoneMid - lastPrice) : null;
     const prox = dist == null ? 0 : Math.exp(- (dist*dist) / (2 * Math.pow((atrRef ?? (lastPrice*0.003)) * 0.6, 2)));
     const entry_confidence = bestZone ? clamp01(0.6 * prox + 0.25 * (bestZone.score ?? 0) + 0.15 * (confirm ? 1 : 0)) : 0;
     const signal_confidence = clamp01(Math.abs((tfResults['1h']?.score ?? 0)) / 40);
-    const ready = (signal_confidence >= 0.6) && (entry_confidence >= 0.6) && confirm && inZone;
+    // Hybrid readiness: pullback mode uses inZone; breakout mode uses nearTrigger
+    const entryMode = (pullbackValid ? 'PULLBACK' : 'BREAKOUT');
+    const ready = (signal_confidence >= 0.6) &&
+                  (entry_confidence >= 0.6) &&
+                  confirm &&
+                  (entryMode === 'PULLBACK' ? inZone : nearTrigger);
 
     // ---------- Output (scalp, swing-style concise) ----------
     const output = {
@@ -930,34 +1003,60 @@ export default async function handler(req, res) {
             fvg_overlap: !!z.fvg_overlap, score: Number((z.score ?? 0).toFixed(3))
           }))
         : [],
-      order_plan: bestZone && bands && bands.level1 ? {
-        side: (() => {
+      order_plan: (() => {
+        const side = (() => {
           if (final_signal === 'STRONG BUY') return 'STRONG BUY';
           if (final_signal === 'BUY') return 'BUY';
           if (final_signal === 'STRONG SELL') return 'STRONG SELL';
           if (final_signal === 'SELL') return 'SELL';
           return 'HOLD';
-        })(),
-        entry_range: { low: suggestions.level1.entry_range.low, high: suggestions.level1.entry_range.high },
-        entry: suggestions.level1.entry,
-        stop: suggestions.level1.stop_loss,
-        tp1: suggestions.level1.take_profit_1,
-        tp2: suggestions.level1.take_profit_2,
-        atr_used: suggestions.level1.atr_used,
-        ready
-      } : {
-        side: (() => {
-          if (final_signal === 'STRONG BUY') return 'STRONG BUY';
-          if (final_signal === 'BUY') return 'BUY';
-          if (final_signal === 'STRONG SELL') return 'STRONG SELL';
-          if (final_signal === 'SELL') return 'SELL';
-          return 'HOLD';
-        })(),
-        entry_range: { low: null, high: null },
-        entry: null, stop: null, tp1: null, tp2: null,
-        atr_used: tfResults['15m']?.indicators?.atr14 ?? null,
-        ready: false
-      },
+        })();
+        // Build plan for pullback or breakout
+        if (entryMode === 'PULLBACK' && bestZone && bands && bands.level1 && suggestions.level1) {
+          const entryVal = suggestions.level1.entry;
+          const entryRange = { low: suggestions.level1.entry_range.low, high: suggestions.level1.entry_range.high };
+          const entryType = (() => {
+            if (dirMap === 'UP') return (Number.isFinite(lastPrice) && Number.isFinite(entryVal) && entryVal < lastPrice) ? 'LIMIT' : 'STOP';
+            if (dirMap === 'DOWN') return (Number.isFinite(lastPrice) && Number.isFinite(entryVal) && entryVal > lastPrice) ? 'LIMIT' : 'STOP';
+            return null;
+          })();
+          return {
+            side,
+            entry_mode: entryMode,
+            entry_type: entryType,
+            entry_range: entryRange,
+            entry: entryVal,
+            stop: suggestions.level1.stop_loss,
+            tp1: suggestions.level1.take_profit_1,
+            tp2: suggestions.level1.take_profit_2,
+            atr_used: suggestions.level1.atr_used,
+            ready
+          };
+        }
+        // Breakout fallback plan
+        const trigger = breakoutTrigger;
+        const entryVal = Number.isFinite(trigger) ? trigger : null;
+        const entryRange = { low: entryVal, high: entryVal };
+        const m = slMultipliers['level1'];
+        const stopsTargets = computeStopsAndTargets(dirMap, entryVal, atrRef, m);
+        const entryType = (() => {
+          if (dirMap === 'UP') return (Number.isFinite(entryVal) && Number.isFinite(lastPrice) && entryVal > lastPrice) ? 'STOP' : 'LIMIT';
+          if (dirMap === 'DOWN') return (Number.isFinite(entryVal) && Number.isFinite(lastPrice) && entryVal < lastPrice) ? 'STOP' : 'LIMIT';
+          return null;
+        })();
+        return {
+          side,
+          entry_mode: entryMode,
+          entry_type: entryType,
+          entry_range: entryRange,
+          entry: entryVal,
+          stop: stopsTargets?.sl ?? null,
+          tp1: stopsTargets?.tp1 ?? null,
+          tp2: stopsTargets?.tp2 ?? null,
+          atr_used: atrRef,
+          ready
+        };
+      })(),
       flip_zone: bestZone ? {
         price: zoneMid,
         description: bestZone.includes0714 ? 'includes 0.714 confluence' : (bestZone.includesExt ? 'includes extension confluence' : 'confluence zone'),
