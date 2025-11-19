@@ -758,6 +758,7 @@ export default async function handler(req, res) {
       const ext1618 = (impulse && impulse.low != null && impulse.high != null)
         ? (impulse.dir === 'UP' ? (impulse.low + 1.618*(impulse.high-impulse.low))
                                 : (impulse.high - 1.618*(impulse.high-impulse.low))) : null;
+      const impulseMatchesTrade = !!(impulse && ((dir === 'UP' && impulse.dir === 'UP') || (dir === 'DOWN' && impulse.dir === 'DOWN')));
 
       if (dir === 'UP') {
         const candidates = [];
@@ -765,16 +766,26 @@ export default async function handler(req, res) {
         if (Number.isFinite(nearestLow)) candidates.push(nearestLow - a * 0.05);
         candidates.push(e - a * m);
         sl = Math.min(...candidates.filter(Number.isFinite));
-        tp1 = Number.isFinite(ext1272) ? ext1272 : (e + a * m * 1.0);
-        tp2 = Number.isFinite(ext1618) ? ext1618 : (e + a * m * 2.0);
+        if (impulseMatchesTrade) {
+          tp1 = Number.isFinite(ext1272) ? ext1272 : (e + a * m * 1.0);
+          tp2 = Number.isFinite(ext1618) ? ext1618 : (e + a * m * 2.0);
+        } else {
+          tp1 = e + a * m * 1.0;
+          tp2 = e + a * m * 2.0;
+        }
       } else if (dir === 'DOWN') {
         const candidates = [];
         if (Number.isFinite(retr786)) candidates.push(retr786 + a * 0.05);
         if (Number.isFinite(nearestHigh)) candidates.push(nearestHigh + a * 0.05);
         candidates.push(e + a * m);
         sl = Math.max(...candidates.filter(Number.isFinite));
-        tp1 = Number.isFinite(ext1272) ? ext1272 : (e - a * m * 1.0);
-        tp2 = Number.isFinite(ext1618) ? ext1618 : (e - a * m * 2.0);
+        if (impulseMatchesTrade) {
+          tp1 = Number.isFinite(ext1272) ? ext1272 : (e - a * m * 1.0);
+          tp2 = Number.isFinite(ext1618) ? ext1618 : (e - a * m * 2.0);
+        } else {
+          tp1 = e - a * m * 1.0;
+          tp2 = e - a * m * 2.0;
+        }
       } else {
         sl  = e - a * m;
         tp1 = e + a * m * 0.8;
@@ -1079,6 +1090,12 @@ export default async function handler(req, res) {
         bos: bos15 ? { dir: bos15.dir, broken_level: null, impulse_low: bos15.low, impulse_high: bos15.high } : null,
         swing_support: (() => { const e = lastPrice; if (!e) return null; const lows = swings15?.swingLows || []; const arr = lows.filter(x=>x.price < e).map(x=>x.price); return arr.length? Math.max(...arr): null; })(),
         swing_resistance: (() => { const e = lastPrice; if (!e) return null; const highs = swings15?.swingHighs || []; const arr = highs.filter(x=>x.price > e).map(x=>x.price); return arr.length? Math.min(...arr): null; })()
+      },
+      debug: {
+        confirm: !!confirm,
+        in_zone: !!inZone,
+        near_trigger: !!nearTrigger,
+        entry_mode: entryMode
       }
     };
 
