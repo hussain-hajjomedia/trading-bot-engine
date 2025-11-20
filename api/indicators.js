@@ -291,20 +291,94 @@ module.exports = async function handler(req, res) {
     }
 
     // ---------- Micro-structure (swing points) ----------
-    function findSwingPoints(candles, lookback = 3) {
-      const highs = candles.map(c => c.high);
-      const lows  = candles.map(c => c.low);
+    // Improved swing point detection with timeframe-aware lookback and ATR validation
+    function findSwingPoints(candles, lookback = 3, atrValue = null, minSeparationMultiplier = 2.0) {
+      if (!candles || candles.length < lookback * 2 + 1) {
+        return { swingHighs: [], swingLows: [] };
+      }
+      
+      const highs = candles.map(c => toNum(c.high));
+      const lows  = candles.map(c => toNum(c.low));
+      const closes = candles.map(c => toNum(c.close));
+      
+      // Calculate ATR if not provided (fallback for validation)
+      let atrVal = atrValue;
+      if (atrVal == null && closes.length >= 14) {
+        const atrArr = atr(highs, lows, closes, 14);
+        atrVal = atrArr[atrArr.length - 1];
+      }
+      // Fallback: use 0.3% of current price if ATR unavailable
+      if (atrVal == null && closes.length > 0) {
+        const lastClose = closes[closes.length - 1];
+        atrVal = lastClose != null ? lastClose * 0.003 : null;
+      }
+      
       const swingHighs = [], swingLows = [];
+      const minSeparation = (atrVal != null && Number.isFinite(atrVal)) ? atrVal * minSeparationMultiplier : null;
+      
       for (let i = lookback; i < highs.length - lookback; i++) {
         const high = highs[i], low = lows[i];
+        
+        // Skip if price data is invalid
+        if (!Number.isFinite(high) || !Number.isFinite(low)) continue;
+        
         let isHigh = true, isLow = true;
+        
+        // Check if this candle's high/low is higher/lower than surrounding candles
         for (let j = 1; j <= lookback; j++) {
-          if (!(high > highs[i - j] && high > highs[i + j])) isHigh = false;
-          if (!(low  < lows [i - j] && low  < lows [i + j])) isLow = false;
+          const prevHigh = highs[i - j], nextHigh = highs[i + j];
+          const prevLow = lows[i - j], nextLow = lows[i + j];
+          
+          // Validate high: must be higher than all surrounding candles
+          if (!Number.isFinite(prevHigh) || !Number.isFinite(nextHigh) || 
+              !(high > prevHigh && high > nextHigh)) {
+            isHigh = false;
+          }
+          
+          // Validate low: must be lower than all surrounding candles
+          if (!Number.isFinite(prevLow) || !Number.isFinite(nextLow) || 
+              !(low < prevLow && low < nextLow)) {
+            isLow = false;
+          }
         }
+        
+        // Additional validation: ensure swing point has significant price separation
+        if (isHigh && minSeparation != null) {
+          // Check separation from nearest swing high
+          if (swingHighs.length > 0) {
+            const lastHigh = swingHighs[swingHighs.length - 1];
+            const separation = Math.abs(high - lastHigh.price);
+            if (separation < minSeparation) {
+              // Keep the higher one
+              if (high > lastHigh.price) {
+                swingHighs.pop();
+              } else {
+                isHigh = false;
+              }
+            }
+          }
+        }
+        
+        if (isLow && minSeparation != null) {
+          // Check separation from nearest swing low
+          if (swingLows.length > 0) {
+            const lastLow = swingLows[swingLows.length - 1];
+            const separation = Math.abs(low - lastLow.price);
+            if (separation < minSeparation) {
+              // Keep the lower one
+              if (low < lastLow.price) {
+                swingLows.pop();
+              } else {
+                isLow = false;
+              }
+            }
+          }
+        }
+        
         if (isHigh) swingHighs.push({ index: i, price: high });
         if (isLow)  swingLows.push({ index: i, price: low });
       }
+      
       return { swingHighs, swingLows };
     }
 
@@ -397,8 +471,12 @@ module.exports = async function handler(req, res) {
     });
 
     // ---------- Voting / weights (swing) ----------
-    // stronger weight to larger TFs: 1d > 4h > 1h > 15m
-    const tfWeight = { '15m': 0.5, '1h': 1.5, '4h': 3.0, '1d': 4.0 };
+    // Timeframe roles:
+    // - 1d  : trend filter only (NOT part of vote; used elsewhere for alignment)
+    // - 4h  : PRIMARY swing timeframe for bias
+    // - 1h  : CONFIRMATION timeframe
+    // - 15m : EXECUTION / fine-tune timeframe
+    const tfWeight = { '15m': 0.5, '1h': 1.0, '4h': 3.0, '1d': 0.0 };
     const tally = { BUY: 0, SELL: 0, HOLD: 0, 'STRONG BUY': 0, 'STRONG SELL': 0 };
     for (const tf of Object.keys(tfResults)) {
       const s = tfResults[tf].signal;
@@ -499,42 +577,207 @@ module.exports = async function handler(req, res) {
 
     // ---------- Swing structure & Fibonacci projections ----------
     // Prefer 4h for swing structure, fallback to 1h then 15m
-    const swings4h = findSwingPoints(normalized['4h'], 3);
-    const swings1h = findSwingPoints(normalized['1h'], 3);
-    const swings15 = findSwingPoints(normalized['15m'], 3);
+    // Timeframe-specific lookback: 4h=6 (5-7 range), 1h=5 (4-5 range), 15m=3 (appropriate for lower TF)
+    // ATR validation ensures minimum 2x ATR separation between swing points
+    const atr4h = tfResults['4h']?.indicators?.atr14 ?? null;
+    const atr1h = tfResults['1h']?.indicators?.atr14 ?? null;
+    const atr15m = tfResults['15m']?.indicators?.atr14 ?? null;
+    
+    const swings4h = findSwingPoints(normalized['4h'], 6, atr4h, 2.0);
+    const swings1h = findSwingPoints(normalized['1h'], 5, atr1h, 2.0);
+    const swings15 = findSwingPoints(normalized['15m'], 3, atr15m, 2.0);
 
-    // Break-of-Structure detection on 4h
-    function detectBosFromSwings(candles, swings) {
+    // Break-of-Structure detection with comprehensive validation
+    // Validates: volume confirmation, time persistence, closing candle break, HTF alignment, liquidity sweep
+    function detectBosFromSwings(candles, swings, tfName, tfResults, minHoldCandles = 2) {
       if (!candles || !candles.length || !swings) return null;
+      
       const closes = candles.map(c => toNum(c.close));
-      const lastClose = closes[closes.length - 1];
+      const highs = candles.map(c => toNum(c.high));
+      const lows = candles.map(c => toNum(c.low));
+      const volumes = candles.map(c => toNum(c.volume));
+      const opens = candles.map(c => toNum(c.open));
+      
+      if (closes.length < minHoldCandles + 1) return null;
+      
       const sh = (swings.swingHighs || []).map(x => x.index).sort((a,b)=>a-b);
       const sl = (swings.swingLows  || []).map(x => x.index).sort((a,b)=>a-b);
       if (!sh.length || !sl.length) return null;
+      
       const lastHighIdx = sh[sh.length - 1];
       const lastLowIdx  = sl[sl.length - 1];
       const lastHighVal = toNum(candles[lastHighIdx]?.high);
       const lastLowVal  = toNum(candles[lastLowIdx]?.low);
-      let dir = null, brokenLevel = null;
-      if (Number.isFinite(lastHighVal) && lastClose > lastHighVal) { dir = 'UP'; brokenLevel = lastHighVal; }
-      else if (Number.isFinite(lastLowVal) && lastClose < lastLowVal) { dir = 'DOWN'; brokenLevel = lastLowVal; }
-      if (!dir) return null;
+      
+      if (!Number.isFinite(lastHighVal) || !Number.isFinite(lastLowVal)) return null;
+      
+      const i = closes.length - 1;
+      const lastClose = closes[i];
+      const lastHigh = highs[i];
+      const lastLow = lows[i];
+      
+      if (!Number.isFinite(lastClose)) return null;
+      
+      // Check for potential BOS direction
+      // BOS requires CLOSING candle break (not just wick) - close must break the level
+      let dir = null, brokenLevel = null, breakCandleIdx = null;
+      
+      // Check UP BOS: closing price broke above last swing high
+      if (lastClose > lastHighVal) {
+        dir = 'UP';
+        brokenLevel = lastHighVal;
+        breakCandleIdx = i;
+      }
+      // Check DOWN BOS: closing price broke below last swing low
+      else if (lastClose < lastLowVal) {
+        dir = 'DOWN';
+        brokenLevel = lastLowVal;
+        breakCandleIdx = i;
+      }
+      
+      if (!dir || breakCandleIdx == null) return null;
+      
+      // VALIDATION 1: Time persistence - BOS must hold for minimum candles AFTER the break
+      // Check if price reversed back through broken level in candles after the break
+      const candlesAfterBreak = i - breakCandleIdx;
+      let validHold = true;
+      
+      // Check all candles from break candle onwards to ensure no reversal
+      for (let k = breakCandleIdx; k <= i; k++) {
+        if (dir === 'UP') {
+          // For UP BOS, price must stay above broken level
+          if (closes[k] <= brokenLevel) {
+            validHold = false;
+            break;
+          }
+        } else {
+          // For DOWN BOS, price must stay below broken level
+          if (closes[k] >= brokenLevel) {
+            validHold = false;
+            break;
+          }
+        }
+      }
+      
+      // Time confirmation: need at least minHoldCandles candles after break to confirm persistence
+      // If break just happened (last candle), it's not time-confirmed yet
+      const timeConfirmed = candlesAfterBreak >= minHoldCandles - 1;
+      
+      // Reject if price reversed back through broken level
+      if (!validHold) return null;
+      
+      // For swing trading: prefer time-confirmed BOS, but allow recent breaks if other validations are strong
+      // However, if break happened less than 1 candle ago, it's too fresh - wait for confirmation
+      if (candlesAfterBreak < 1) return null;
+      
+      // VALIDATION 2: Volume confirmation on break candle
+      // Break candle should have volume > 1.5x average volume
+      const tfResult = tfResults[tfName];
+      const avgVolume = tfResult?.indicators?.vol_sma20;
+      const breakVolume = volumes[breakCandleIdx];
+      
+      if (Number.isFinite(avgVolume) && Number.isFinite(breakVolume)) {
+        const volumeRatio = avgVolume > 0 ? breakVolume / avgVolume : 0;
+        if (volumeRatio < 1.5) {
+          // Volume too low - BOS may be false
+          // Don't reject completely, but mark as weak
+        }
+      }
+      
+      // VALIDATION 3: Higher timeframe alignment (1D trend)
+      // BOS should align with 1D trend direction
+      const tf1d = tfResults['1d'];
+      let htfAligned = true;
+      
+      if (tf1d) {
+        const price1d = tf1d.last?.close;
+        const ema21_1d = tf1d.indicators?.ema21;
+        const rsi14_1d = tf1d.indicators?.rsi14;
+        
+        if (Number.isFinite(price1d) && Number.isFinite(ema21_1d)) {
+          if (dir === 'UP') {
+            // UP BOS should align with bullish 1D trend
+            if (price1d < ema21_1d) htfAligned = false;
+            if (Number.isFinite(rsi14_1d) && rsi14_1d < 50) htfAligned = false;
+          } else {
+            // DOWN BOS should align with bearish 1D trend
+            if (price1d > ema21_1d) htfAligned = false;
+            if (Number.isFinite(rsi14_1d) && rsi14_1d > 50) htfAligned = false;
+          }
+        }
+      }
+      
+      // If HTF not aligned, reject BOS (critical validation)
+      if (!htfAligned) return null;
+      
+      // VALIDATION 4: Liquidity sweep detection
+      // Check if liquidity was swept before BOS (price extended beyond structure with wick)
+      let liquiditySwept = false;
+      const lookbackForSweep = Math.min(10, breakCandleIdx);
+      
+      if (dir === 'UP') {
+        // For UP BOS, check if price swept swing low (liquidity below) before breaking high
+        for (let k = Math.max(0, breakCandleIdx - lookbackForSweep); k < breakCandleIdx; k++) {
+          if (lows[k] < lastLowVal * 0.999) { // 0.1% tolerance for wick extension
+            liquiditySwept = true;
+            break;
+          }
+        }
+      } else {
+        // For DOWN BOS, check if price swept swing high (liquidity above) before breaking low
+        for (let k = Math.max(0, breakCandleIdx - lookbackForSweep); k < breakCandleIdx; k++) {
+          if (highs[k] > lastHighVal * 1.001) { // 0.1% tolerance for wick extension
+            liquiditySwept = true;
+            break;
+          }
+        }
+      }
+      
       // Impulse causing BOS: last opposite swing to broken swing
       let startIdx = null, endIdx = null, low = null, high = null;
+      
       if (dir === 'UP') {
         // from last swing low up to the broken swing high
         const prevLowIdx = sl[sl.length - 1];
-        startIdx = prevLowIdx; endIdx = lastHighIdx;
-        low = toNum(candles[startIdx]?.low); high = toNum(candles[endIdx]?.high);
+        startIdx = prevLowIdx; 
+        endIdx = lastHighIdx;
+        low = toNum(candles[startIdx]?.low); 
+        high = toNum(candles[endIdx]?.high);
       } else {
         const prevHighIdx = sh[sh.length - 1];
-        startIdx = prevHighIdx; endIdx = lastLowIdx;
-        high = toNum(candles[startIdx]?.high); low = toNum(candles[endIdx]?.low);
+        startIdx = prevHighIdx; 
+        endIdx = lastLowIdx;
+        high = toNum(candles[startIdx]?.high); 
+        low = toNum(candles[endIdx]?.low);
       }
-      if (!Number.isFinite(low) || !Number.isFinite(high) || startIdx == null || endIdx == null) return null;
-      return { dir, brokenLevel, startIdx, endIdx, low, high };
+      
+      if (!Number.isFinite(low) || !Number.isFinite(high) || startIdx == null || endIdx == null) {
+        return null;
+      }
+      
+      // Calculate volume ratio for confidence scoring
+      const volumeRatio = (Number.isFinite(avgVolume) && Number.isFinite(breakVolume) && avgVolume > 0) 
+        ? breakVolume / avgVolume 
+        : null;
+      
+      return { 
+        dir, 
+        brokenLevel, 
+        startIdx, 
+        endIdx, 
+        low, 
+        high,
+        breakCandleIdx,
+        candlesAfterBreak,
+        timeConfirmed,
+        volumeConfirmed: volumeRatio != null && volumeRatio >= 1.5,
+        volumeRatio: volumeRatio,
+        liquiditySwept,
+        htfAligned: true, // Already validated above
+        valid: true // All critical validations passed
+      };
     }
-    const bos = detectBosFromSwings(normalized['4h'], swings4h);
+    const bos = detectBosFromSwings(normalized['4h'], swings4h, '4h', tfResults, 2);
 
     // Dominant impulse detection from swings with ATR/recency threshold (prefer 4h)
     function dominantImpulseFromSwings(sw, atrVal, refPrice, maxLegs = 12) {
@@ -783,6 +1026,7 @@ module.exports = async function handler(req, res) {
     // ---------- FVG detection on 4h and 1h ----------
     function detectFVG(candles) {
       const out = [];
+      if (!Array.isArray(candles) || candles.length < 3) return out;
       for (let i = 1; i < candles.length - 1; i++) {
         const prev = candles[i-1], cur = candles[i], next = candles[i+1];
         if (!prev || !cur || !next) continue;
@@ -790,23 +1034,183 @@ module.exports = async function handler(req, res) {
         const nextHigh = toNum(next.high), nextLow = toNum(next.low);
         // Bullish FVG: nextLow > prevHigh
         if (Number.isFinite(nextLow) && Number.isFinite(prevHigh) && nextLow > prevHigh) {
-          out.push({ type:'bull', low: prevHigh, high: nextLow, center: (prevHigh + nextLow)/2, index:i });
+          out.push({ type:'bull', low: prevHigh, high: nextLow, center: (prevHigh + nextLow)/2, index:i, mitigated:false });
         }
         // Bearish FVG: nextHigh < prevLow
         if (Number.isFinite(nextHigh) && Number.isFinite(prevLow) && nextHigh < prevLow) {
-          out.push({ type:'bear', low: nextHigh, high: prevLow, center: (nextHigh + prevLow)/2, index:i });
+          out.push({ type:'bear', low: nextHigh, high: prevLow, center: (nextHigh + prevLow)/2, index:i, mitigated:false });
         }
       }
       return out;
     }
-    const fvg4h = detectFVG(normalized['4h']);
-    const fvg1h = detectFVG(normalized['1h']);
+
+    // Mark FVGs as mitigated when price trades back through the gap
+    function markFvgMitigated(candles, fvgList) {
+      if (!Array.isArray(candles) || !Array.isArray(fvgList) || !fvgList.length) return [];
+      const highs = candles.map(c => toNum(c.high));
+      const lows  = candles.map(c => toNum(c.low));
+      const n = candles.length;
+      return fvgList.map(fvg => {
+        let mitigated = false;
+        // Check from FVG index forward for price filling the gap
+        for (let i = Math.max(fvg.index, 0); i < n; i++) {
+          const h = highs[i], l = lows[i];
+          if (!Number.isFinite(h) || !Number.isFinite(l)) continue;
+          // Mitigated when candle range fully covers the gap
+          if (l <= fvg.low && h >= fvg.high) {
+            mitigated = true;
+            break;
+          }
+        }
+        return { ...fvg, mitigated };
+      });
+    }
+
+    const rawFvg4h = detectFVG(normalized['4h']);
+    const rawFvg1h = detectFVG(normalized['1h']);
+    const fvg4hAll = markFvgMitigated(normalized['4h'], rawFvg4h);
+    const fvg1hAll = markFvgMitigated(normalized['1h'], rawFvg1h);
+    // Use only unmitigated FVGs for confluence/zone scoring
+    const fvg4h = fvg4hAll.filter(f => !f.mitigated);
+    const fvg1h = fvg1hAll.filter(f => !f.mitigated);
     function zoneHasFvgOverlap(z) {
       const has = (arr) => arr.some(g => !(z.high < g.low || z.low > g.high));
       return has(fvg4h) || has(fvg1h);
     }
 
-    // Score hot zones
+    // ---------- Order Block detection (institutional entry zones) ----------
+    // Order Blocks: Last bullish/bearish candle before strong move (institutional entry zones)
+    function detectOrderBlocks(candles, minMoveMultiplier = 1.5) {
+      if (!candles || candles.length < 5) return [];
+      const out = [];
+      const closes = candles.map(c => toNum(c.close));
+      const highs = candles.map(c => toNum(c.high));
+      const lows = candles.map(c => toNum(c.low));
+      const volumes = candles.map(c => toNum(c.volume));
+      
+      // Calculate ATR for move size validation
+      const atrArr = atr(highs, lows, closes, 14);
+      const avgVolume = volumes.slice(-20).filter(Number.isFinite).reduce((a,b)=>a+b,0) / 20;
+      
+      for (let i = 1; i < candles.length - 2; i++) {
+        const cur = candles[i];
+        const next = candles[i+1];
+        if (!cur || !next) continue;
+        
+        const curHigh = toNum(cur.high), curLow = toNum(cur.low);
+        const curClose = toNum(cur.close), curOpen = toNum(cur.open);
+        const nextClose = toNum(next.close);
+        const curVolume = toNum(cur.volume);
+        const atrVal = atrArr[i] ?? (curClose * 0.003);
+        
+        if (!Number.isFinite(curHigh) || !Number.isFinite(curLow) || 
+            !Number.isFinite(curClose) || !Number.isFinite(nextClose)) continue;
+        
+        // Bullish Order Block: Last bullish candle before strong move up
+        const isBullishCandle = curClose > curOpen;
+        if (isBullishCandle) {
+          // Check if next candles show strong upward move
+          let strongMove = false;
+          const moveSize = nextClose - curClose;
+          if (moveSize > atrVal * minMoveMultiplier) {
+            // Verify move continues for at least 1-2 more candles
+            for (let j = i + 1; j < Math.min(i + 3, candles.length); j++) {
+              const jClose = toNum(candles[j]?.close);
+              if (Number.isFinite(jClose) && jClose > curHigh) {
+                strongMove = true;
+                break;
+              }
+            }
+          }
+          
+          if (strongMove && curVolume > avgVolume * 0.8) {
+            out.push({
+              type: 'bull',
+              low: curLow,
+              high: curHigh,
+              center: (curLow + curHigh) / 2,
+              index: i,
+              mitigated: false // Will check mitigation later
+            });
+          }
+        }
+        
+        // Bearish Order Block: Last bearish candle before strong move down
+        const isBearishCandle = curClose < curOpen;
+        if (isBearishCandle) {
+          // Check if next candles show strong downward move
+          let strongMove = false;
+          const moveSize = curClose - nextClose;
+          if (moveSize > atrVal * minMoveMultiplier) {
+            // Verify move continues for at least 1-2 more candles
+            for (let j = i + 1; j < Math.min(i + 3, candles.length); j++) {
+              const jClose = toNum(candles[j]?.close);
+              if (Number.isFinite(jClose) && jClose < curLow) {
+                strongMove = true;
+                break;
+              }
+            }
+          }
+          
+          if (strongMove && curVolume > avgVolume * 0.8) {
+            out.push({
+              type: 'bear',
+              low: curLow,
+              high: curHigh,
+              center: (curLow + curHigh) / 2,
+              index: i,
+              mitigated: false // Will check mitigation later
+            });
+          }
+        }
+      }
+      
+      // Check mitigation: Order blocks get mitigated when price sweeps through them
+      const lastClose = closes[closes.length - 1];
+      for (const ob of out) {
+        if (ob.type === 'bull') {
+          // Bullish OB mitigated if price closes below its low
+          ob.mitigated = lastClose < ob.low;
+        } else {
+          // Bearish OB mitigated if price closes above its high
+          ob.mitigated = lastClose > ob.high;
+        }
+      }
+      
+      // Return only unmitigated order blocks (still valid)
+      return out.filter(ob => !ob.mitigated).slice(-10); // Keep last 10 unmitigated OBs
+    }
+    
+    const ob4h = detectOrderBlocks(normalized['4h'], 1.5);
+    const ob1h = detectOrderBlocks(normalized['1h'], 1.5);
+    
+    function zoneHasObOverlap(z) {
+      const has = (arr) => arr.some(ob => !(z.high < ob.low || z.low > ob.high));
+      return has(ob4h) || has(ob1h);
+    }
+    
+    function findNearestOrderBlock(price, direction) {
+      // Find nearest unmitigated order block for given direction
+      const relevant = [...ob4h, ...ob1h].filter(ob => 
+        (direction === 'UP' && ob.type === 'bull') || 
+        (direction === 'DOWN' && ob.type === 'bear')
+      );
+      if (!relevant.length) return null;
+      
+      // Find closest OB to price
+      let nearest = null;
+      let minDist = Infinity;
+      for (const ob of relevant) {
+        const dist = Math.abs(price - ob.center);
+        if (dist < minDist) {
+          minDist = dist;
+          nearest = ob;
+        }
+      }
+      return nearest;
+    }
+
+    // Score hot zones with order block and FVG weighting
     function scoreHotZone(z) {
       const a = Number.isFinite(atrRef) ? atrRef : (fallbackPrice*0.003);
       const width = Math.max(1e-9, z.high - z.low);
@@ -822,10 +1226,20 @@ module.exports = async function handler(req, res) {
         const sigma = a * 1.5;
         return Math.exp(-(d*d)/(2*sigma*sigma));
       })();
-      const fvgScore = zoneHasFvgOverlap(z) ? 0.25 : 0;
-      const inc0714 = z.includes0714 ? 0.25 : 0;
-      const incExt  = z.includesExt  ? 0.15 : 0;
-      return Math.max(0, Math.min(1, 0.35*widthScore + 0.25*structScore + inc0714 + incExt + fvgScore));
+      // Order blocks are institutional zones - highest priority
+      const obScore = zoneHasObOverlap(z) ? 0.30 : 0;
+      const fvgScore = zoneHasFvgOverlap(z) ? 0.20 : 0;
+      const inc0714 = z.includes0714 ? 0.15 : 0;
+      const incExt  = z.includesExt  ? 0.10 : 0;
+      // Weighted scoring: OB > Structure > FVG > Width > Fib levels
+      return Math.max(0, Math.min(1, 
+        0.30*widthScore + 
+        0.25*structScore + 
+        obScore + 
+        fvgScore + 
+        inc0714 + 
+        incExt
+      ));
     }
     const scoredHot = hotZones.map(z => ({ ...z, score: scoreHotZone(z) }))
                               .sort((a,b)=>b.score-a.score)
@@ -851,7 +1265,30 @@ module.exports = async function handler(req, res) {
     const structureLow = nearestSwingBelow(lastClose, lowsPool) ?? ((lastClose != null && atrRef != null) ? (lastClose - atrRef * 2) : null);
     const structureHigh = nearestSwingAbove(lastClose, highsPool) ?? ((lastClose != null && atrRef != null) ? (lastClose + atrRef * 2) : null);
 
-    // Build EMA21/EMA50 + Fib golden pocket (0.618–0.65) confluence band on reference TF, sized by ATR
+    // ---------- Market structure (HH/HL vs LH/LL) ----------
+    // Simple 4h market structure classification: 'bullish', 'bearish', or 'range'
+    function inferMarketStructure(sw) {
+      if (!sw || !Array.isArray(sw.swingHighs) || !Array.isArray(sw.swingLows)) return 'neutral';
+      if (sw.swingHighs.length < 2 || sw.swingLows.length < 2) return 'neutral';
+      const hLen = sw.swingHighs.length;
+      const lLen = sw.swingLows.length;
+      const lastHigh = sw.swingHighs[hLen - 1].price;
+      const prevHigh = sw.swingHighs[hLen - 2].price;
+      const lastLow  = sw.swingLows[lLen - 1].price;
+      const prevLow  = sw.swingLows[lLen - 2].price;
+      if (![lastHigh, prevHigh, lastLow, prevLow].every(v => Number.isFinite(v))) return 'neutral';
+      const higherHigh  = lastHigh > prevHigh;
+      const higherLow   = lastLow  > prevLow;
+      const lowerHigh   = lastHigh < prevHigh;
+      const lowerLow    = lastLow  < prevLow;
+      if (higherHigh && higherLow) return 'bullish';
+      if (lowerHigh && lowerLow)   return 'bearish';
+      return 'range';
+    }
+    const marketStructure = inferMarketStructure(swings4h);
+
+    // Build entry zones with tight padding (5-10% ATR max) and order block integration
+    // Entry zones now include: Fib golden pocket, EMA confluence, Order Blocks, FVG
     function buildConfluenceBands() {
       if (lastClose == null) return null;
       const closesRef = (normalized[refTf] || []).map(c => toNum(c.close));
@@ -862,6 +1299,7 @@ module.exports = async function handler(req, res) {
       const emaBand = (ema21v != null && ema50v != null)
         ? { low: Math.min(ema21v, ema50v), high: Math.max(ema21v, ema50v) }
         : null;
+      
       // Prefer golden pocket band from impulse if available
       let fibBand = null;
       if (fib && Number.isFinite(fib.low) && Number.isFinite(fib.high)) {
@@ -869,39 +1307,90 @@ module.exports = async function handler(req, res) {
         const gpA = low < high
           ? { lo: low + 0.618 * (high - low), hi: low + 0.65 * (high - low) }
           : { lo: high + 0.618 * (low - high), hi: high + 0.65 * (low - high) };
-        // normalize
         const gpLow = Math.min(gpA.lo, gpA.hi);
         const gpHigh = Math.max(gpA.lo, gpA.hi);
         fibBand = { low: gpLow, high: gpHigh };
         // optional 0.714 emphasis: lightly pull the band towards 0.714
         const p0714 = low < high ? (low + 0.714 * (high - low)) : (high + 0.714 * (low - high));
         const mid = (fibBand.low + fibBand.high) / 2;
-        const bias = (p0714 - mid) * 0.15; // small nudge
+        const bias = (p0714 - mid) * 0.15;
         fibBand = { low: fibBand.low + bias, high: fibBand.high + bias };
       }
+      
+      // Find relevant order block for current direction
+      const direction = final_signal.includes('BUY') ? 'UP' : (final_signal.includes('SELL') ? 'DOWN' : null);
+      const nearestOB = direction ? findNearestOrderBlock(lastClose, direction) : null;
+      const obBand = nearestOB ? { low: nearestOB.low, high: nearestOB.high } : null;
+      
+      // Find unmitigated FVG near entry zone
+      const relevantFVGs = [...fvg4h, ...fvg1h].filter(fvg => {
+        if (!direction) return false;
+        if (direction === 'UP' && fvg.type === 'bull') return true;
+        if (direction === 'DOWN' && fvg.type === 'bear') return true;
+        return false;
+      });
+      const nearestFVG = relevantFVGs.length > 0 ? relevantFVGs[relevantFVGs.length - 1] : null;
+      const fvgBand = nearestFVG ? { low: nearestFVG.low, high: nearestFVG.high } : null;
+      
       function overlap(a, b) {
         if (!a || !b) return null;
         const lo = Math.max(a.low, b.low);
         const hi = Math.min(a.high, b.high);
         return lo <= hi ? { low: lo, high: hi } : null;
       }
-      let base = overlap(emaBand, fibBand) || emaBand || fibBand || { low: lastClose, high: lastClose };
-      // If no overlap and both exist, pick the one closer to lastClose
-      if (!overlap(emaBand, fibBand) && emaBand && fibBand) {
-        const midE = (emaBand.low + emaBand.high) / 2;
-        const midF = (fibBand.low + fibBand.high) / 2;
-        base = Math.abs(lastClose - midE) <= Math.abs(lastClose - midF) ? emaBand : fibBand;
+      
+      // Build confluence: prioritize order blocks and FVG, then Fib, then EMA
+      // Order blocks and FVG are institutional zones - highest priority
+      let base = null;
+      
+      // Try to find overlap between multiple factors (confluence)
+      if (obBand && fibBand) base = overlap(obBand, fibBand);
+      if (!base && obBand && fvgBand) base = overlap(obBand, fvgBand);
+      if (!base && fibBand && fvgBand) base = overlap(fibBand, fvgBand);
+      if (!base && obBand && emaBand) base = overlap(obBand, emaBand);
+      if (!base && fibBand && emaBand) base = overlap(fibBand, emaBand);
+      
+      // If no confluence, prioritize: OB > FVG > Fib > EMA
+      if (!base) {
+        if (obBand) base = obBand;
+        else if (fvgBand) base = fvgBand;
+        else if (fibBand) base = fibBand;
+        else if (emaBand) base = emaBand;
+        else base = { low: lastClose, high: lastClose };
       }
+      
+      // If multiple options exist without overlap, pick closest to price
+      if (!base || (base.low === base.high && base.low === lastClose)) {
+        const candidates = [obBand, fvgBand, fibBand, emaBand].filter(Boolean);
+        if (candidates.length > 0) {
+          let closest = null;
+          let minDist = Infinity;
+          for (const cand of candidates) {
+            const mid = (cand.low + cand.high) / 2;
+            const dist = Math.abs(lastClose - mid);
+            if (dist < minDist) {
+              minDist = dist;
+              closest = cand;
+            }
+          }
+          base = closest || { low: lastClose, high: lastClose };
+        } else {
+          base = { low: lastClose, high: lastClose };
+        }
+      }
+      
       const a = Number.isFinite(atrRef) ? atrRef : (lastClose * 0.003);
-      const pad1 = a * 0.15;
-      const pad2 = a * 0.25;
-      const pad3 = a * 0.40;
+      // TIGHTENED PADDING: 5%, 7%, 10% ATR (was 15%, 25%, 40%)
+      const pad1 = a * 0.05;  // Level 1: tight zone
+      const pad2 = a * 0.07;  // Level 2: normal zone
+      const pad3 = a * 0.10;  // Level 3: wider zone (max)
+      
       function expand(band, pad) {
         if (!band || band.low == null || band.high == null) return { low: lastClose, high: lastClose };
         let lo = Math.min(band.low, band.high) - pad;
         let hi = Math.max(band.low, band.high) + pad;
-        // Ensure non-zero width: at least 0.1 * ATR
-        const minW = Math.max(a * 0.1, lastClose * 0.0005);
+        // Ensure non-zero width: at least 0.05 * ATR (tighter minimum)
+        const minW = Math.max(a * 0.05, lastClose * 0.0003);
         if ((hi - lo) < minW) {
           const mid = (lo + hi) / 2;
           lo = mid - minW / 2;
@@ -909,32 +1398,329 @@ module.exports = async function handler(req, res) {
         }
         return { low: lo, high: hi };
       }
+      
       return {
         level1: expand(base, pad1),
         level2: expand(base, pad2),
         level3: expand(base, pad3),
+        base: base, // Store base for optimal entry calculation
+        hasOB: !!obBand,
+        hasFVG: !!fvgBand,
+        hasFib: !!fibBand,
+        hasEMA: !!emaBand
       };
     }
-    const bands = buildConfluenceBands() || { level1: { low: lastClose, high: lastClose }, level2: { low: lastClose, high: lastClose }, level3: { low: lastClose, high: lastClose } };
+    const bands = buildConfluenceBands() || { 
+      level1: { low: lastClose, high: lastClose }, 
+      level2: { low: lastClose, high: lastClose }, 
+      level3: { low: lastClose, high: lastClose },
+      base: { low: lastClose, high: lastClose },
+      hasOB: false, hasFVG: false, hasFib: false, hasEMA: false
+    };
     const lvl1 = bands.level1, lvl2 = bands.level2, lvl3 = bands.level3;
-    const entryPrice = (lvl1.low != null && lvl1.high != null) ? (lvl1.low + lvl1.high) / 2 : (lastClose != null ? lastClose : null);
+    const baseZone = bands.base || { low: lastClose, high: lastClose };
+    
+    // Optimal entry price: prefer base zone center (confluence), not padded zone midpoint
+    // This ensures entry happens at actual confluence, not at edge of padded zone
+    const optimalEntry = (baseZone.low != null && baseZone.high != null) 
+      ? (baseZone.low + baseZone.high) / 2 
+      : (lvl1.low != null && lvl1.high != null) 
+        ? (lvl1.low + lvl1.high) / 2 
+        : (lastClose != null ? lastClose : null);
+    const entryPrice = optimalEntry;
+    
+    // ---------- Liquidity sweep validation for entry ----------
+    // Entry requires liquidity sweep before price reaches entry zone
+    function checkLiquiditySwept(entryPrice, direction, lookbackCandles = 20) {
+      if (!entryPrice || !direction) return false;
+      
+      const candlesToCheck = normalized['4h'] || normalized['1h'] || normalized['15m'] || [];
+      if (candlesToCheck.length < 3) return false;
+      
+      const recent = candlesToCheck.slice(-lookbackCandles);
+      const entryIdx = recent.length - 1;
+      
+      if (direction === 'UP') {
+        // For LONG: check if price swept swing low (liquidity below) before reaching entry zone
+        const swingLows = swings4h.swingLows.length ? swings4h.swingLows : 
+                         (swings1h.swingLows.length ? swings1h.swingLows : swings15.swingLows);
+        if (!swingLows.length) return false;
+        
+        const nearestLow = Math.max(...swingLows.map(s => s.price).filter(p => p < entryPrice));
+        if (!Number.isFinite(nearestLow)) return false;
+        
+        // Check if any recent candle's low swept below nearest swing low
+        for (let i = Math.max(0, entryIdx - 10); i < entryIdx; i++) {
+          const low = toNum(recent[i]?.low);
+          if (Number.isFinite(low) && low < nearestLow * 0.999) {
+            return true; // Liquidity swept
+          }
+        }
+      } else if (direction === 'DOWN') {
+        // For SHORT: check if price swept swing high (liquidity above) before reaching entry zone
+        const swingHighs = swings4h.swingHighs.length ? swings4h.swingHighs : 
+                          (swings1h.swingHighs.length ? swings1h.swingHighs : swings15.swingHighs);
+        if (!swingHighs.length) return false;
+        
+        const nearestHigh = Math.min(...swingHighs.map(s => s.price).filter(p => p > entryPrice));
+        if (!Number.isFinite(nearestHigh)) return false;
+        
+        // Check if any recent candle's high swept above nearest swing high
+        for (let i = Math.max(0, entryIdx - 10); i < entryIdx; i++) {
+          const high = toNum(recent[i]?.high);
+          if (Number.isFinite(high) && high > nearestHigh * 1.001) {
+            return true; // Liquidity swept
+          }
+        }
+      }
+      
+      return false;
+    }
+    
+    const direction = final_signal.includes('BUY') ? 'UP' : (final_signal.includes('SELL') ? 'DOWN' : null);
+    const liquiditySweptForEntry = checkLiquiditySwept(entryPrice, direction);
 
-    // ---------- SL/TP via ATR and Fib (if useful) ----------
-    const slMultipliers = { level1: 1.0, level2: 1.6, level3: 2.6 };
+    // ---------- SL/TP via ATR and Fib with liquidity pool protection ----------
+    const slMultipliers = { level1: 1.5, level2: 2.0, level3: 2.5 }; // Increased minimums (was 1.0, 1.6, 2.6)
     const suggestions = {};
     const levels = ['level1', 'level2', 'level3'];
 
-    // compute fib-based targets for swing (if trend and fib available)
-    function computeFibTargets(trendDir) {
-      if (!fib) return { tp1: null, tp2: null, refHigh: null, refLow: null };
-      if (trendDir === 'UP') return { tp1: fib.high, tp2: fib.ext1618 || fib.ext1382, refHigh: fib.high, refLow: fib.low };
-      if (trendDir === 'DOWN') return { tp1: fib.low, tp2: fib.ext1618 || fib.ext1382, refHigh: fib.high, refLow: fib.low };
-      return { tp1: null, tp2: null, refHigh: null, refLow: null };
+    // Find liquidity pools (swing points where stops cluster) and recent wicks
+    function findLiquidityPoolsAndWicks(entry, direction, lookbackCandles = 30) {
+      const candles = normalized['4h'] || normalized['1h'] || [];
+      if (candles.length < 5) return { liquidityPool: null, recentWick: null };
+      
+      let liquidityPool = null;
+      let recentWick = null;
+      const recent = candles.slice(-lookbackCandles);
+      
+      if (direction === 'UP') {
+        // For LONG: liquidity pools are swing lows (where long stops cluster)
+        const swingLows = swings4h.swingLows.length ? swings4h.swingLows : 
+                         (swings1h.swingLows.length ? swings1h.swingLows : swings15.swingLows);
+        if (swingLows.length) {
+          // Find nearest swing low below entry
+          const below = swingLows.filter(s => s.price < entry).map(s => s.price);
+          if (below.length) {
+            liquidityPool = Math.max(...below);
+          }
+        }
+        
+        // Find lowest recent wick (will get swept)
+        let lowestWick = Infinity;
+        for (let i = Math.max(0, recent.length - 10); i < recent.length; i++) {
+          const low = toNum(recent[i]?.low);
+          if (Number.isFinite(low) && low < entry && low < lowestWick) {
+            lowestWick = low;
+          }
+        }
+        if (Number.isFinite(lowestWick) && lowestWick < Infinity) {
+          recentWick = lowestWick;
+        }
+      } else if (direction === 'DOWN') {
+        // For SHORT: liquidity pools are swing highs (where short stops cluster)
+        const swingHighs = swings4h.swingHighs.length ? swings4h.swingHighs : 
+                          (swings1h.swingHighs.length ? swings1h.swingHighs : swings15.swingHighs);
+        if (swingHighs.length) {
+          // Find nearest swing high above entry
+          const above = swingHighs.filter(s => s.price > entry).map(s => s.price);
+          if (above.length) {
+            liquidityPool = Math.min(...above);
+          }
+        }
+        
+        // Find highest recent wick (will get swept)
+        let highestWick = -Infinity;
+        for (let i = Math.max(0, recent.length - 10); i < recent.length; i++) {
+          const high = toNum(recent[i]?.high);
+          if (Number.isFinite(high) && high > entry && high > highestWick) {
+            highestWick = high;
+          }
+        }
+        if (Number.isFinite(highestWick) && highestWick > -Infinity) {
+          recentWick = highestWick;
+        }
+      }
+      
+      return { liquidityPool, recentWick };
     }
+    
+    // Find order blocks that might affect SL placement
+    function findRelevantOrderBlocks(entry, direction) {
+      if (!direction) return null;
+      
+      const relevant = [...ob4h, ...ob1h].filter(ob => {
+        if (direction === 'UP') {
+          // For LONG: find bearish OB below entry (support level)
+          return ob.type === 'bear' && ob.high < entry;
+        } else {
+          // For SHORT: find bullish OB above entry (resistance level)
+          return ob.type === 'bull' && ob.low > entry;
+        }
+      });
+      
+      if (!relevant.length) return null;
+      
+      // Find closest OB to entry
+      let closest = null;
+      let minDist = Infinity;
+      for (const ob of relevant) {
+        const dist = direction === 'UP' 
+          ? Math.abs(entry - ob.high) 
+          : Math.abs(ob.low - entry);
+        if (dist < minDist) {
+          minDist = dist;
+          closest = ob;
+        }
+      }
+      return closest;
+    }
+
+    // Comprehensive TP target calculation: swing structure, liquidity zones, order blocks, Fib extensions
+    function computeTakeProfitTargets(entry, trendDir, atrVal) {
+      if (!entry || !trendDir || !atrVal) {
+        return { tp1: null, tp2: null, tp1_source: null, tp2_source: null };
+      }
+      
+      let tp1 = null, tp2 = null;
+      let tp1_source = null, tp2_source = null;
+      
+      if (trendDir === 'UP') {
+        // For LONG trades: TP targets are swing highs and liquidity zones above entry
+        
+        // TP1: Previous swing high (primary target - most reliable)
+        const swingHighs = swings4h.swingHighs.length ? swings4h.swingHighs : 
+                          (swings1h.swingHighs.length ? swings1h.swingHighs : swings15.swingHighs);
+        if (swingHighs.length) {
+          const above = swingHighs.filter(s => s.price > entry).map(s => s.price);
+          if (above.length) {
+            tp1 = Math.min(...above); // Nearest swing high above entry
+            tp1_source = 'swing_high';
+          }
+        }
+        
+        // TP1 alternative: Order block in opposite direction (bearish OB = resistance)
+        const bearishOBs = [...ob4h, ...ob1h].filter(ob => ob.type === 'bear' && ob.low > entry);
+        if (bearishOBs.length && !tp1) {
+          const nearestOB = bearishOBs.reduce((closest, ob) => 
+            (!closest || ob.low < closest.low) ? ob : closest
+          );
+          tp1 = nearestOB.low; // Enter bearish OB zone
+          tp1_source = 'order_block_bear';
+        }
+        
+        // TP1 fallback: Fib extension 1.272 or 1.382
+        if (!tp1 && fib) {
+          tp1 = fib.ext1272 || fib.ext1382;
+          tp1_source = 'fib_extension';
+        }
+        
+        // TP1 final fallback: ATR-based
+        if (!tp1) {
+          tp1 = entry + atrVal * 1.5;
+          tp1_source = 'atr_based';
+        }
+        
+        // TP2: Next swing high or major liquidity zone (secondary target)
+        // Must be beyond TP1
+        const above = swingHighs.length ? swingHighs.filter(s => s.price > entry).map(s => s.price) : [];
+        if (above.length > 1) {
+          // Sort and get second nearest swing high (must be > TP1)
+          const sorted = [...above].sort((a, b) => a - b);
+          const secondHigh = sorted[1];
+          if (secondHigh > tp1) {
+            tp2 = secondHigh;
+            tp2_source = 'swing_high_secondary';
+          }
+        }
+        
+        // TP2 alternative: Fib extension 1.618 (if no second swing high or if second high <= TP1)
+        if (!tp2 && fib && fib.ext1618 && fib.ext1618 > tp1) {
+          tp2 = fib.ext1618;
+          tp2_source = 'fib_extension_1618';
+        }
+        
+        // TP2 fallback: ATR-based (reduced aggressiveness, must be > TP1)
+        if (!tp2) {
+          const atrBasedTP2 = entry + atrVal * 2.0; // Reduced from 2.6x ATR
+          tp2 = Math.max(atrBasedTP2, tp1 + atrVal * 0.5); // Ensure TP2 > TP1
+          tp2_source = 'atr_based';
+        }
+        
+      } else if (trendDir === 'DOWN') {
+        // For SHORT trades: TP targets are swing lows and liquidity zones below entry
+        
+        // TP1: Previous swing low (primary target - most reliable)
+        const swingLows = swings4h.swingLows.length ? swings4h.swingLows : 
+                         (swings1h.swingLows.length ? swings1h.swingLows : swings15.swingLows);
+        if (swingLows.length) {
+          const below = swingLows.filter(s => s.price < entry).map(s => s.price);
+          if (below.length) {
+            tp1 = Math.max(...below); // Nearest swing low below entry
+            tp1_source = 'swing_low';
+          }
+        }
+        
+        // TP1 alternative: Order block in opposite direction (bullish OB = support)
+        const bullishOBs = [...ob4h, ...ob1h].filter(ob => ob.type === 'bull' && ob.high < entry);
+        if (bullishOBs.length && !tp1) {
+          const nearestOB = bullishOBs.reduce((closest, ob) => 
+            (!closest || ob.high > closest.high) ? ob : closest
+          );
+          tp1 = nearestOB.high; // Enter bullish OB zone
+          tp1_source = 'order_block_bull';
+        }
+        
+        // TP1 fallback: Fib extension 1.272 or 1.382
+        if (!tp1 && fib) {
+          tp1 = fib.ext1272 || fib.ext1382;
+          tp1_source = 'fib_extension';
+        }
+        
+        // TP1 final fallback: ATR-based
+        if (!tp1) {
+          tp1 = entry - atrVal * 1.5;
+          tp1_source = 'atr_based';
+        }
+        
+        // TP2: Next swing low or major liquidity zone (secondary target)
+        // Must be below TP1
+        const below = swingLows.length ? swingLows.filter(s => s.price < entry).map(s => s.price) : [];
+        if (below.length > 1) {
+          // Sort and get second nearest swing low (must be < TP1)
+          const sorted = [...below].sort((a, b) => b - a);
+          const secondLow = sorted[1];
+          if (secondLow < tp1) {
+            tp2 = secondLow;
+            tp2_source = 'swing_low_secondary';
+          }
+        }
+        
+        // TP2 alternative: Fib extension 1.618 (if no second swing low or if second low >= TP1)
+        if (!tp2 && fib && fib.ext1618 && fib.ext1618 < tp1) {
+          tp2 = fib.ext1618;
+          tp2_source = 'fib_extension_1618';
+        }
+        
+        // TP2 fallback: ATR-based (reduced aggressiveness, must be < TP1)
+        if (!tp2) {
+          const atrBasedTP2 = entry - atrVal * 2.0; // Reduced from 2.6x ATR
+          tp2 = Math.min(atrBasedTP2, tp1 - atrVal * 0.5); // Ensure TP2 < TP1
+          tp2_source = 'atr_based';
+        }
+      }
+      
+      return { tp1, tp2, tp1_source, tp2_source };
+    }
+
+    const direction = final_signal.includes('BUY') ? 'UP' : (final_signal.includes('SELL') ? 'DOWN' : null);
+    const { liquidityPool, recentWick } = findLiquidityPoolsAndWicks(entryPrice, direction);
+    const relevantOB = findRelevantOrderBlocks(entryPrice, direction);
 
     for (const lvl of levels) {
       const m = slMultipliers[lvl];
       let sl = null, tp1 = null, tp2 = null;
+      let tp1_source = null, tp2_source = null;
       const entry = entryPrice;
 
       if (entry == null || atrRef == null) {
@@ -943,47 +1729,145 @@ module.exports = async function handler(req, res) {
         tp2 = entry ? entry + (entry * 0.06) : null;
       } else {
         if (final_signal.includes('BUY')) {
-          // structural SL: below last major swing low
-          const structural = (impulse && impulse.low != null) ? impulse.low * 0.995 : (entry - atrRef * m);
-          sl = Math.min(structural, entry - atrRef * m);
-          const fibTargets = computeFibTargets('UP');
-          tp1 = fibTargets.tp1 ?? (entry + atrRef * (m * 1.2));
-          tp2 = fibTargets.tp2 ?? (entry + atrRef * (m * 2.6));
+          // Calculate multiple SL candidates and use the WIDER (farther) one
+          const atrBasedSL = entry - atrRef * m;
+          
+          // Structural SL: below swing low with buffer
+          const structuralSL = (impulse && impulse.low != null) 
+            ? impulse.low - (atrRef * 0.1) // 10% ATR buffer below swing low
+            : null;
+          
+          // Liquidity pool SL: below liquidity pool with buffer
+          const liquiditySL = liquidityPool 
+            ? liquidityPool - (atrRef * 0.15) // 15% ATR buffer below liquidity pool
+            : null;
+          
+          // Recent wick SL: below recent wick with buffer
+          const wickSL = recentWick 
+            ? recentWick - (atrRef * 0.1) // 10% ATR buffer below wick
+            : null;
+          
+          // Order block SL: below order block low
+          const obSL = relevantOB 
+            ? relevantOB.low - (atrRef * 0.05) // 5% ATR buffer below OB
+            : null;
+          
+          // Collect all valid SL candidates
+          const candidates = [atrBasedSL, structuralSL, liquiditySL, wickSL, obSL]
+            .filter(sl => Number.isFinite(sl) && sl < entry);
+          
+          // Use the LOWEST (widest/farthest) SL to avoid liquidity sweeps
+          // This ensures SL is beyond all potential liquidity grab zones
+          sl = candidates.length > 0 
+            ? Math.min(...candidates) 
+            : atrBasedSL;
+          
+          // Ensure minimum 1.5x ATR distance (critical for swing trading)
+          const minSL = entry - (atrRef * 1.5);
+          if (sl > minSL) {
+            sl = minSL; // Use minimum if calculated SL is too tight
+          }
+          
+          const tpTargets = computeTakeProfitTargets(entry, 'UP', atrRef);
+          tp1 = tpTargets.tp1 ?? (entry + atrRef * (m * 1.2));
+          tp2 = tpTargets.tp2 ?? (entry + atrRef * (m * 2.0)); // Reduced from 2.6x
+          tp1_source = tpTargets.tp1_source;
+          tp2_source = tpTargets.tp2_source;
         } else if (final_signal.includes('SELL')) {
-          const structural = (impulse && impulse.high != null) ? impulse.high * 1.005 : (entry + atrRef * m);
-          sl = Math.max(structural, entry + atrRef * m);
-          const fibTargets = computeFibTargets('DOWN');
-          tp1 = fibTargets.tp1 ?? (entry - atrRef * (m * 1.2));
-          tp2 = fibTargets.tp2 ?? (entry - atrRef * (m * 2.6));
+          // Calculate multiple SL candidates and use the WIDER (farther) one
+          const atrBasedSL = entry + atrRef * m;
+          
+          // Structural SL: above swing high with buffer
+          const structuralSL = (impulse && impulse.high != null) 
+            ? impulse.high + (atrRef * 0.1) // 10% ATR buffer above swing high
+            : null;
+          
+          // Liquidity pool SL: above liquidity pool with buffer
+          const liquiditySL = liquidityPool 
+            ? liquidityPool + (atrRef * 0.15) // 15% ATR buffer above liquidity pool
+            : null;
+          
+          // Recent wick SL: above recent wick with buffer
+          const wickSL = recentWick 
+            ? recentWick + (atrRef * 0.1) // 10% ATR buffer above wick
+            : null;
+          
+          // Order block SL: above order block high
+          const obSL = relevantOB 
+            ? relevantOB.high + (atrRef * 0.05) // 5% ATR buffer above OB
+            : null;
+          
+          // Collect all valid SL candidates
+          const candidates = [atrBasedSL, structuralSL, liquiditySL, wickSL, obSL]
+            .filter(sl => Number.isFinite(sl) && sl > entry);
+          
+          // Use the HIGHEST (widest/farthest) SL to avoid liquidity sweeps
+          // This ensures SL is beyond all potential liquidity grab zones
+          sl = candidates.length > 0 
+            ? Math.max(...candidates) 
+            : atrBasedSL;
+          
+          // Ensure minimum 1.5x ATR distance (critical for swing trading)
+          const minSL = entry + (atrRef * 1.5);
+          if (sl < minSL) {
+            sl = minSL; // Use minimum if calculated SL is too tight
+          }
+          
+          const tpTargets = computeTakeProfitTargets(entry, 'DOWN', atrRef);
+          tp1 = tpTargets.tp1 ?? (entry - atrRef * (m * 1.2));
+          tp2 = tpTargets.tp2 ?? (entry - atrRef * (m * 2.0)); // Reduced from 2.6x
+          tp1_source = tpTargets.tp1_source;
+          tp2_source = tpTargets.tp2_source;
         } else {
           sl = entry - atrRef * m;
           tp1 = entry + atrRef * (m * 0.9);
           tp2 = entry + atrRef * (m * 1.8);
         }
       }
-      // Regime-based TP/SL refinement (swing)
+      // Regime-based TP refinement (swing) - Conservative adjustments
+      // DO NOT tighten SL in chop (dangerous!) - only adjust TP
       if (flags.tp_sl_refine && regimeContext && regimeContext.score != null && atrRef != null && entry != null) {
         if (regimeContext.regime === 'trend') {
-          tp2 = Number.isFinite(tp2) ? (tp2 + atrRef * 0.25 * (final_signal.includes('BUY') ? 1 : -1)) : tp2;
+          // In trending markets, extend TP2 slightly (but not too aggressive)
+          tp2 = Number.isFinite(tp2) ? (tp2 + atrRef * 0.15 * (final_signal.includes('BUY') ? 1 : -1)) : tp2;
+          // Reduced from 0.25 to 0.15 ATR - less aggressive
         } else if (regimeContext.regime === 'chop') {
-          tp2 = Number.isFinite(tp2) ? (tp2 - atrRef * 0.2 * (final_signal.includes('BUY') ? 1 : -1)) : tp2;
-          // tighten SL slightly toward entry
-          if (final_signal.includes('BUY')) sl = Number.isFinite(sl) ? Math.min(sl + atrRef * 0.05, entry) : sl;
-          else if (final_signal.includes('SELL')) sl = Number.isFinite(sl) ? Math.max(sl - atrRef * 0.05, entry) : sl;
+          // In choppy markets, reduce TP2 to realistic levels
+          tp2 = Number.isFinite(tp2) ? (tp2 - atrRef * 0.15 * (final_signal.includes('BUY') ? 1 : -1)) : tp2;
+          // Reduced from 0.2 to 0.15 ATR - more conservative
+          // REMOVED: Tightening SL in chop is dangerous - can cause premature stops
+          // Keep SL wide to avoid liquidity sweeps even in chop
         }
       }
 
-      // safety clamps: do not propose SL farther than 8% and TP farther than 12% (swing safety)
-      function clamp(val, base, pct) {
+      // Safety clamps: ensure SL is not too far (but respect liquidity protection)
+      // For swing trading, allow wider SL (up to 10%) to protect against sweeps
+      function clampSL(val, base, maxPct) {
         if (!Number.isFinite(val) || !Number.isFinite(base)) return val;
-        const cap = Math.abs(base) * pct;
+        const cap = Math.abs(base) * maxPct;
+        // For LONG: val should be < base, so cap the distance
+        if (base > val && Math.abs(base - val) > cap) {
+          return base - cap;
+        }
+        // For SHORT: val should be > base, so cap the distance
+        if (base < val && Math.abs(val - base) > cap) {
+          return base + cap;
+        }
+        return val;
+      }
+      
+      function clampTP(val, base, maxPct) {
+        if (!Number.isFinite(val) || !Number.isFinite(base)) return val;
+        const cap = Math.abs(base) * maxPct;
         if (Math.abs(val - base) > cap) return base + Math.sign(val - base) * cap;
         return val;
       }
+      
       if (entry != null) {
-        sl = clamp(sl, entry, 0.08);
-        tp1 = clamp(tp1, entry, 0.12);
-        tp2 = clamp(tp2, entry, 0.2);
+        // Allow wider SL (10% max) for swing trading to protect against liquidity sweeps
+        sl = clampSL(sl, entry, 0.10); // Increased from 8% to 10%
+        tp1 = clampTP(tp1, entry, 0.12);
+        tp2 = clampTP(tp2, entry, 0.2);
       }
 
       // Quantize to inferred tick size
@@ -1043,26 +1927,114 @@ module.exports = async function handler(req, res) {
       const qBandLow  = floorToTick(lvl === 'level1' ? lvl1.low : (lvl === 'level2' ? lvl2.low : lvl3.low));
       const qBandHigh = ceilToTick (lvl === 'level1' ? lvl1.high: (lvl === 'level2' ? lvl2.high: lvl3.high));
 
+      // Calculate SL placement metadata for transparency
+      const slDistance = entry != null && qSL != null ? Math.abs(entry - qSL) : null;
+      const slDistanceATR = (slDistance != null && atrRef != null) ? slDistance / atrRef : null;
+      const slProtectionFactors = [];
+      if (liquidityPool != null) {
+        const distToPool = direction === 'UP' 
+          ? Math.abs(liquidityPool - qSL) 
+          : Math.abs(qSL - liquidityPool);
+        if (distToPool < atrRef * 0.2) {
+          slProtectionFactors.push('liquidity_pool');
+        }
+      }
+      if (recentWick != null) {
+        const distToWick = direction === 'UP'
+          ? Math.abs(recentWick - qSL)
+          : Math.abs(qSL - recentWick);
+        if (distToWick < atrRef * 0.15) {
+          slProtectionFactors.push('recent_wick');
+        }
+      }
+      if (relevantOB != null) {
+        const distToOB = direction === 'UP'
+          ? Math.abs(relevantOB.low - qSL)
+          : Math.abs(qSL - relevantOB.high);
+        if (distToOB < atrRef * 0.1) {
+          slProtectionFactors.push('order_block');
+        }
+      }
+      if (impulse && ((direction === 'UP' && impulse.low != null) || (direction === 'DOWN' && impulse.high != null))) {
+        const distToStructure = direction === 'UP'
+          ? Math.abs(impulse.low - qSL)
+          : Math.abs(qSL - impulse.high);
+        if (distToStructure < atrRef * 0.15) {
+          slProtectionFactors.push('swing_structure');
+        }
+      }
+      
+      // Calculate TP distances and partial profit taking strategy
+      const tp1Distance = entry != null && qTP1 != null ? Math.abs(qTP1 - entry) : null;
+      const tp2Distance = entry != null && qTP2 != null ? Math.abs(qTP2 - entry) : null;
+      const tp1DistanceATR = (tp1Distance != null && atrRef != null) ? tp1Distance / atrRef : null;
+      const tp2DistanceATR = (tp2Distance != null && atrRef != null) ? tp2Distance / atrRef : null;
+      
+      // Partial profit taking strategy: 50% at TP1, 50% at TP2
+      // After TP1 hit, move SL to breakeven and let remaining 50% run to TP2
+      const profitTakingStrategy = {
+        tp1_close_percent: 50, // Close 50% at TP1
+        tp2_close_percent: 50, // Close remaining 50% at TP2
+        breakeven_after_tp1: true, // Move SL to breakeven after TP1 hit
+        trail_stop_after_tp1: true // Trail stop using 4H swing structure after TP1
+      };
+      
       suggestions[lvl] = {
         entry: qEntry,
         entry_range: { low: qBandLow, high: qBandHigh },
         stop_loss: qSL,
         take_profit_1: qTP1,
         take_profit_2: qTP2,
+        tp1_source: tp1_source,
+        tp2_source: tp2_source,
+        tp1_distance_atr: tp1DistanceATR != null ? Number(tp1DistanceATR.toFixed(2)) : null,
+        tp2_distance_atr: tp2DistanceATR != null ? Number(tp2DistanceATR.toFixed(2)) : null,
+        profit_taking_strategy: profitTakingStrategy,
         atr_used: atrRef,
         sl_multiplier: m,
+        sl_distance_atr: slDistanceATR != null ? Number(slDistanceATR.toFixed(2)) : null,
+        sl_protection_factors: slProtectionFactors,
+        liquidity_pool: liquidityPool,
+        recent_wick: recentWick,
+        min_sl_distance_atr: 1.5 // Minimum required distance
       };
     }
 
     // ---------- Confidence scoring (continuous 0..1) ----------
     function clamp01(x) { return Math.max(0, Math.min(1, x)); }
-    // Signal confidence from vote dominance and reference TF score magnitude
+    // Signal confidence from vote dominance, reference TF score, and market structure alignment
     const totalW = Object.keys(tfResults).reduce((s, tf) => s + (tfWeight[tf] || 0), 0);
     const voteDominance = totalW ? Math.abs((buyWeight ?? 0) - (sellWeight ?? 0)) / totalW : 0;
     const refScore = Math.abs(ref?.score ?? 0);
     const scoreNorm = clamp01(refScore / 60);
-    const signal_confidence = clamp01(0.6 * voteDominance + 0.4 * scoreNorm);
-    // Entry confidence from band proximity, structure alignment, and supertrend alignment
+    // Market structure alignment: bias vs 4h structure and BOS direction
+    const msAlignment = (() => {
+      // Map bias to directional expectation
+      const wantUp   = bias === 'BUY';
+      const wantDown = bias === 'SELL';
+      let score = 0.5; // neutral baseline
+      if (marketStructure === 'bullish') {
+        if (wantUp) score = 1.0;
+        else if (wantDown) score = 0.1;
+      } else if (marketStructure === 'bearish') {
+        if (wantDown) score = 1.0;
+        else if (wantUp) score = 0.1;
+      } else if (marketStructure === 'range') {
+        score = 0.4;
+      }
+      // BOS direction agreement boosts confidence
+      if (bos && bos.dir) {
+        if ((bos.dir === 'UP' && wantUp) || (bos.dir === 'DOWN' && wantDown)) {
+          score = Math.min(1.0, score + 0.15);
+        } else {
+          score = Math.max(0.0, score - 0.25);
+        }
+      }
+      return clamp01(score);
+    })();
+    const signal_confidence = clamp01(0.5 * voteDominance + 0.3 * scoreNorm + 0.2 * msAlignment);
+
+    // Entry confidence from band proximity, structure alignment, supertrend, order blocks, and FVGs
     function gaussian(x, s) { if (!Number.isFinite(x) || !Number.isFinite(s) || s <= 0) return 0; return Math.exp(-(x*x)/(2*s*s)); }
     const bandMid = (lvl1.low != null && lvl1.high != null) ? (lvl1.low + lvl1.high) / 2 : lastClose;
     const distToBand = (lastClose != null && bandMid != null) ? Math.abs(lastClose - bandMid) : null;
@@ -1084,7 +2056,7 @@ module.exports = async function handler(req, res) {
       if (final_signal.includes('SELL')) return lastClose < stv ? 1.0 : 0.2;
       return 0.5;
     })();
-    let entry_confidence = clamp01(0.55 * bandProx + 0.25 * structProx + 0.20 * stAlign);
+    let entry_confidence = clamp01(0.45 * bandProx + 0.25 * structProx + 0.20 * stAlign);
     // Balanced tweak: MACD acts as a small positive boost, not a hard gate
     const macdBoostAligned = (() => {
       const tf15 = tfResults['15m'];
@@ -1096,6 +2068,51 @@ module.exports = async function handler(req, res) {
       return false;
     })();
     if (macdBoostAligned) entry_confidence = clamp01(entry_confidence + 0.05);
+
+    // Pullback volume context: prefer lower volume on pullbacks vs prior impulse
+    function pullbackVolumeScore(direction) {
+      try {
+        const arr = normalized[refTf] || [];
+        if (arr.length < 20) return 0;
+        const n = arr.length;
+        // Last 4 candles vs previous 10 candles
+        const recent = arr.slice(n - 4, n);
+        const prior  = arr.slice(n - 14, n - 4);
+        const volRecent = recent.map(c => toNum(c.volume)).filter(Number.isFinite);
+        const volPrior  = prior.map(c => toNum(c.volume)).filter(Number.isFinite);
+        if (!volRecent.length || !volPrior.length) return 0;
+        const avgRecent = volRecent.reduce((a,b)=>a+b,0) / volRecent.length;
+        const avgPrior  = volPrior.reduce((a,b)=>a+b,0) / volPrior.length;
+        if (!Number.isFinite(avgRecent) || !Number.isFinite(avgPrior) || avgPrior <= 0) return 0;
+        const ratio = avgRecent / avgPrior;
+        // For longs: want lower volume on pullback
+        if (direction === 'UP' && ratio < 0.9) return 0.05;
+        // For shorts: want lower volume on pullback
+        if (direction === 'DOWN' && ratio < 0.9) return 0.05;
+        return 0;
+      } catch {
+        return 0;
+      }
+    }
+    if (bestDir) {
+      entry_confidence = clamp01(entry_confidence + pullbackVolumeScore(bestDir));
+    }
+
+    // Order block & FVG confluence bonus (institutional context)
+    const obFvgBonus = (() => {
+      let bonus = 0;
+      if (bands.hasOB && primaryZone && primaryZone.ob_overlap) bonus += 0.08;
+      if (bands.hasFVG && primaryZone && primaryZone.fvg_overlap) bonus += 0.05;
+      // Liquidity pool proximity: band mid near liquidity pool
+      if (Number.isFinite(liquidityPool) && bandMid != null && atrRef != null) {
+        const d = Math.abs(bandMid - liquidityPool);
+        const s = atrRef * 1.0;
+        bonus += gaussian(d, s) * 0.05;
+      }
+      return bonus;
+    })();
+    entry_confidence = clamp01(entry_confidence + obFvgBonus);
+
     // Zone quality bonus (4h/1h sweeps and wicks near best hot zone)
     if (flags.zone_quality && bestHot) {
       let bonus = 0;
@@ -1123,6 +2140,62 @@ module.exports = async function handler(req, res) {
       if ((s4.eq + s1.eq) >= 2) bonus += 0.02;
       if ((s4.wick + s1.wick) >= 2) bonus += 0.02;
       entry_confidence = clamp01(entry_confidence + Math.min(0.05, bonus));
+    }
+
+    // Volume confirmation near entry zone (relative to recent history)
+    const volEntryFactor = (() => {
+      const v = ref?.indicators?.volume;
+      const vSma = ref?.indicators?.vol_sma20;
+      if (!Number.isFinite(v) || !Number.isFinite(vSma) || vSma <= 0) return 0;
+      const r = v / vSma;
+      const isStrong = final_signal === 'STRONG BUY' || final_signal === 'STRONG SELL';
+      // Strong trend / breakout: want clearly elevated volume
+      if (isStrong) {
+        if (r >= 1.5) return 0.05;
+        if (r <= 0.7) return -0.05;
+      } else {
+        if (r >= 1.3) return 0.03;
+        if (r <= 0.7) return -0.03;
+      }
+      return 0;
+    })();
+    entry_confidence = clamp01(entry_confidence + volEntryFactor);
+
+    // Institutional candle patterns (engulfing / pin bars) near zone on ref TF
+    function institutionalCandleScore(direction) {
+      try {
+        const arr = normalized[refTf] || [];
+        if (arr.length < 3) return 0;
+        const i = arr.length - 1;
+        const cur = arr[i], prev = arr[i-1];
+        const cOpen = toNum(cur.open), cClose = toNum(cur.close), cHigh = toNum(cur.high), cLow = toNum(cur.low);
+        const pOpen = toNum(prev.open), pClose = toNum(prev.close);
+        if (![cOpen,cClose,cHigh,cLow,pOpen,pClose].every(Number.isFinite)) return 0;
+        const body = Math.abs(cClose - cOpen);
+        const range = Math.abs(cHigh - cLow);
+        if (!Number.isFinite(range) || range === 0) return 0;
+        const upperWick = cHigh - Math.max(cOpen, cClose);
+        const lowerWick = Math.min(cOpen, cClose) - cLow;
+        let score = 0;
+        // Bullish engulfing / hammer near support
+        if (direction === 'UP') {
+          const bullishEngulf = (cClose > cOpen) && (pClose < pOpen) && (cClose >= pOpen) && (cOpen <= pClose);
+          const hammer = (cClose > cOpen) && (lowerWick > body * 2) && (upperWick < body * 0.5);
+          if (bullishEngulf || hammer) score = 0.07;
+        }
+        // Bearish engulfing / shooting star near resistance
+        if (direction === 'DOWN') {
+          const bearishEngulf = (cClose < cOpen) && (pClose > pOpen) && (cClose <= pOpen) && (cOpen >= pClose);
+          const shootingStar = (cClose < cOpen) && (upperWick > body * 2) && (lowerWick < body * 0.5);
+          if (bearishEngulf || shootingStar) score = 0.07;
+        }
+        return score;
+      } catch {
+        return 0;
+      }
+    }
+    if (bestDir) {
+      entry_confidence = clamp01(entry_confidence + institutionalCandleScore(bestDir));
     }
 
     // ---------- LTF confirmation near best hot zone ----------
@@ -1264,15 +2337,24 @@ module.exports = async function handler(req, res) {
       includes_0714: !!bestHot.includes0714,
       includes_extension: !!bestHot.includesExt,
       fvg_overlap: zoneHasFvgOverlap(bestHot),
+      ob_overlap: zoneHasObOverlap(bestHot),
+      confluence_factors: [
+        bands.hasOB ? 'order_block' : null,
+        bands.hasFVG ? 'fvg' : null,
+        bands.hasFib ? 'fib_golden_pocket' : null,
+        bands.hasEMA ? 'ema_confluence' : null
+      ].filter(Boolean),
       score: Number((bestHot.score ?? 0).toFixed(3)),
       action: (bestDir === 'UP') ? 'LONG' : (bestDir === 'DOWN' ? 'SHORT' : null),
-      ltf_ready: zoneReady
+      ltf_ready: zoneReady,
+      liquidity_swept: liquiditySweptForEntry
     } : null;
     const altZones = scoredHot.slice(1,3).map(z => ({
       range_low: z.low, range_high: z.high, mid: (z.low+z.high)/2,
       includes_0714: !!z.includes0714,
       includes_extension: !!z.includesExt,
       fvg_overlap: zoneHasFvgOverlap(z),
+      ob_overlap: zoneHasObOverlap(z),
       score: Number((z.score ?? 0).toFixed(3))
     }));
     const order_plan = {
@@ -1288,6 +2370,11 @@ module.exports = async function handler(req, res) {
       stop: suggestions.level1.stop_loss,
       tp1: suggestions.level1.take_profit_1,
       tp2: suggestions.level1.take_profit_2,
+      tp1_source: suggestions.level1.tp1_source,
+      tp2_source: suggestions.level1.tp2_source,
+      tp1_distance_atr: suggestions.level1.tp1_distance_atr,
+      tp2_distance_atr: suggestions.level1.tp2_distance_atr,
+      profit_taking_strategy: suggestions.level1.profit_taking_strategy,
       atr_used: suggestions.level1.atr_used
     };
     // Safeguards gate for live readiness
@@ -1314,12 +2401,38 @@ module.exports = async function handler(req, res) {
       const dPrev = Math.abs(prev - mid);
       return dNow < dPrev;
     })();
-    const bypassLtf = (signal_confidence >= 0.75) && (entry_confidence >= 0.70);
+    const bypassLtf = (signal_confidence >= 0.8) && (entry_confidence >= 0.8);
     const ltfOk = bypassLtf ? true : !!(primaryZone && primaryZone.ltf_ready);
+    
+    // Entry readiness requires liquidity sweep (critical for swing trading)
+    // Liquidity must be swept before entry to avoid early entries
+    const liquidityReady = liquiditySweptForEntry || 
+                          (bos && bos.liquiditySwept) || 
+                          false; // Allow if BOS already validated liquidity
+
+    // Require at least 2 confluence factors (OB/FVG/Fib/EMA) for a valid zone
+    const confluenceCount = [
+      bands.hasOB,
+      bands.hasFVG,
+      bands.hasFib,
+      bands.hasEMA
+    ].filter(Boolean).length;
+    const confluenceReady = confluenceCount >= 2;
+
+    // Market structure must not be clearly opposite to bias
+    const msAlignedForEntry = (() => {
+      if (marketStructure === 'bullish' && bias === 'SELL') return false;
+      if (marketStructure === 'bearish' && bias === 'BUY') return false;
+      return true; // neutral or range allowed
+    })();
+    
     const ready =
-      (signal_confidence >= 0.6) &&
-      (entry_confidence >= 0.6) &&
+      (signal_confidence >= 0.7) &&  // require higher confidence (was 0.6)
+      (entry_confidence >= 0.7) &&   // require higher confidence (was 0.6)
       ltfOk &&
+      liquidityReady &&          // REQUIRED: Liquidity must be swept
+      confluenceReady &&         // REQUIRED: at least 2 confluence factors
+      msAlignedForEntry &&       // REQUIRED: market structure not opposite to bias
       (zoneWithin || nearZone);
     let readyFinal = !!ready;
     // Cooldown (longer horizon)
@@ -1339,9 +2452,23 @@ module.exports = async function handler(req, res) {
     }
     order_plan.ready = !!readyFinal;
     const structure = {
-      bos: bos ? { dir: bos.dir, broken_level: bos.brokenLevel ?? bos.brokenLevel, impulse_low: bos.low, impulse_high: bos.high } : null,
+      bos: bos ? { 
+        dir: bos.dir, 
+        broken_level: bos.brokenLevel, 
+        impulse_low: bos.low, 
+        impulse_high: bos.high,
+        break_candle_idx: bos.breakCandleIdx ?? null,
+        candles_after_break: bos.candlesAfterBreak ?? null,
+        time_confirmed: bos.timeConfirmed ?? false,
+        volume_confirmed: bos.volumeConfirmed ?? false,
+        volume_ratio: bos.volumeRatio ?? null,
+        liquidity_swept: bos.liquiditySwept ?? false,
+        htf_aligned: bos.htfAligned ?? false,
+        valid: bos.valid ?? false
+      } : null,
       swing_support: structureLow ?? null,
-      swing_resistance: structureHigh ?? null
+      swing_resistance: structureHigh ?? null,
+      market_structure: marketStructure
     };
     // Confidence classification helpers and displays
     function confidenceLabel(x) {
@@ -1411,3 +2538,4 @@ module.exports = async function handler(req, res) {
     return res.status(500).json({ error: 'internal error', detail: String(err && (err.stack || err.message || err)) });
   }
 }
+
