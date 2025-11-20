@@ -934,7 +934,7 @@ module.exports = async function handler(req, res) {
         flip_zone_confidence = Math.max(0, Math.min(1, best.combined));
       
         // Compute the midpoint of the flip zone (exact price)
-        const flipMid = (best.low + best.high) / 2
+        const flipMid = (best.low + best.high) / 2;
         flip_zone_price = flipMid;
         flip_zone_description = `${best.name} (${flipMid ? flipMid.toFixed(2) : 'n/a'})`;
         // Determine recommended action at flip zone
@@ -1245,6 +1245,10 @@ module.exports = async function handler(req, res) {
                               .sort((a,b)=>b.score-a.score)
                               .slice(0, 5);
 
+    // Declare bestHot and bestDir early so they can be used in confidence calculations
+    const bestHot = scoredHot[0] || null;
+    const bestDir = bos?.dir || (final_signal.includes('BUY') ? 'UP' : (final_signal.includes('SELL') ? 'DOWN' : null));
+
     // ---------- Entry & TP/SL construction ----------
     // Reference timeframe for entry: prefer 4h structural last close
     const refTf = tfResults['4h']?.last?.close ? '4h'
@@ -1479,6 +1483,10 @@ module.exports = async function handler(req, res) {
     
     const direction = final_signal.includes('BUY') ? 'UP' : (final_signal.includes('SELL') ? 'DOWN' : null);
     const liquiditySweptForEntry = checkLiquiditySwept(entryPrice, direction);
+    
+    // Calculate liquidity pools early (needed for confidence calculations)
+    const { liquidityPool, recentWick } = findLiquidityPoolsAndWicks(entryPrice, direction);
+    const relevantOB = findRelevantOrderBlocks(entryPrice, direction);
 
     // ---------- SL/TP via ATR and Fib with liquidity pool protection ----------
     const slMultipliers = { level1: 1.5, level2: 2.0, level3: 2.5 }; // Increased minimums (was 1.0, 1.6, 2.6)
@@ -1713,9 +1721,7 @@ module.exports = async function handler(req, res) {
       return { tp1, tp2, tp1_source, tp2_source };
     }
 
-    // direction already declared above (line 1480)
-    const { liquidityPool, recentWick } = findLiquidityPoolsAndWicks(entryPrice, direction);
-    const relevantOB = findRelevantOrderBlocks(entryPrice, direction);
+    // liquidityPool, recentWick, and relevantOB already declared earlier (after direction)
 
     for (const lvl of levels) {
       const m = slMultipliers[lvl];
@@ -2009,9 +2015,9 @@ module.exports = async function handler(req, res) {
     const scoreNorm = clamp01(refScore / 60);
     // Market structure alignment: bias vs 4h structure and BOS direction
     const msAlignment = (() => {
-      // Map bias to directional expectation
-      const wantUp   = bias === 'BUY';
-      const wantDown = bias === 'SELL';
+      // Map bias to directional expectation (using final_signal since bias is defined later)
+      const wantUp   = final_signal.includes('BUY');
+      const wantDown = final_signal.includes('SELL');
       let score = 0.5; // neutral baseline
       if (marketStructure === 'bullish') {
         if (wantUp) score = 1.0;
@@ -2101,8 +2107,9 @@ module.exports = async function handler(req, res) {
     // Order block & FVG confluence bonus (institutional context)
     const obFvgBonus = (() => {
       let bonus = 0;
-      if (bands.hasOB && primaryZone && primaryZone.ob_overlap) bonus += 0.08;
-      if (bands.hasFVG && primaryZone && primaryZone.fvg_overlap) bonus += 0.05;
+      // Use bestHot directly since primaryZone is declared later
+      if (bands.hasOB && bestHot && zoneHasObOverlap(bestHot)) bonus += 0.08;
+      if (bands.hasFVG && bestHot && zoneHasFvgOverlap(bestHot)) bonus += 0.05;
       // Liquidity pool proximity: band mid near liquidity pool
       if (Number.isFinite(liquidityPool) && bandMid != null && atrRef != null) {
         const d = Math.abs(bandMid - liquidityPool);
@@ -2234,8 +2241,7 @@ module.exports = async function handler(req, res) {
         return true;
       } catch { return false; }
     }
-    const bestHot = scoredHot[0] || null;
-    const bestDir = bos?.dir || (final_signal.includes('BUY') ? 'UP' : (final_signal.includes('SELL') ? 'DOWN' : null));
+    // bestHot and bestDir already declared earlier (after scoredHot)
     const zoneReady = bestDir ? (flags.ltf_stability ? ltfConfirm1hStable(bestDir) : ltfConfirm(bestDir)) : false;
     // Position size factor
     const sizeFactor = clamp01(
