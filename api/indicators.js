@@ -1713,7 +1713,7 @@ module.exports = async function handler(req, res) {
       return { tp1, tp2, tp1_source, tp2_source };
     }
 
-    const direction = final_signal.includes('BUY') ? 'UP' : (final_signal.includes('SELL') ? 'DOWN' : null);
+    // direction already declared above (line 1480)
     const { liquidityPool, recentWick } = findLiquidityPoolsAndWicks(entryPrice, direction);
     const relevantOB = findRelevantOrderBlocks(entryPrice, direction);
 
