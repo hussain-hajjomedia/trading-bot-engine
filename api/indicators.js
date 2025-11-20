@@ -2260,6 +2260,20 @@ module.exports = async function handler(req, res) {
       ltf_ready: zoneReady,
       liquidity_swept: liquiditySweptForEntry
     } : null;
+
+    // Swing zone staleness: if current price has moved far away from the primary hot zone
+    // relative to 4h ATR, treat it as informational only (no fresh entries).
+    // This does NOT remove the zone, it just gates readiness.
+    let zoneStale = false;
+    if (primaryZone && Number.isFinite(primaryZone.mid) && Number.isFinite(currentPrice) && Number.isFinite(atrRef) && atrRef > 0) {
+      const dist = Math.abs(currentPrice - primaryZone.mid);
+      const distAtr = dist / atrRef;
+      const STALE_ATR_MULT = 4.0; // ~4x 4h ATR away from zone mid is considered stale
+      if (distAtr >= STALE_ATR_MULT) zoneStale = true;
+      // Expose on primaryZone for clients
+      primaryZone.stale = zoneStale;
+      primaryZone.distance_atr = Number(distAtr.toFixed(2));
+    }
     const altZones = scoredHot.slice(1,3).map(z => ({
       range_low: z.low, range_high: z.high, mid: (z.low+z.high)/2,
       includes_0714: !!z.includes0714,
@@ -2343,6 +2357,7 @@ module.exports = async function handler(req, res) {
       liquidityReady &&          // REQUIRED: Liquidity must be swept
       confluenceReady &&         // REQUIRED: at least 2 confluence factors
       msAlignedForEntry &&       // REQUIRED: market structure not opposite to bias
+      !zoneStale &&              // NEW: do not execute on stale swing zones
       (zoneWithin || nearZone);
     let readyFinal = !!ready;
     // Cooldown (longer horizon)
