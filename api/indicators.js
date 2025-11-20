@@ -10,7 +10,7 @@ module.exports = async function handler(req, res) {
 
   try {
     const payload = req.body || {};
-    let { symbol, exchangeSymbol, kline_15m, kline_1h, kline_4h, kline_1d, tickSize, priceTickSize, stepSize } = payload;
+    let { symbol, exchangeSymbol, kline_15m, kline_1h, kline_4h, kline_1d, tickSize, priceTickSize } = payload;
 
     // -------- Feature Flags and cooldown client-assist --------
     const inputFlags = (payload && typeof payload.flags === 'object') ? payload.flags : {};
@@ -22,7 +22,6 @@ module.exports = async function handler(req, res) {
       zone_quality:       !!inputFlags.zone_quality,
       tp_sl_refine:       !!inputFlags.tp_sl_refine,
       cooldown:           !!inputFlags.cooldown,
-      wf_calibrate:       !!inputFlags.wf_calibrate,
     };
     const clientLastReadyIndex = Number.isFinite(Number(payload?.lastReadyIndex)) ? Number(payload.lastReadyIndex) : null;
     const clientLastReadyTime  = Number.isFinite(Number(payload?.lastReadyTime))  ? Number(payload.lastReadyTime)  : null;
@@ -84,8 +83,6 @@ module.exports = async function handler(req, res) {
           low: safe(row[3]),
           close: safe(row[4]),
           volume: safe(row[5]),
-          closeTime: safe(row[6]),
-          trades: safe(row[8]),
         };
       } else if (typeof row === 'object') {
         return {
@@ -95,8 +92,6 @@ module.exports = async function handler(req, res) {
           low: safe(row.low ?? row.l ?? null),
           close: safe(row.close ?? row.c ?? null),
           volume: safe(row.volume ?? row.v ?? null),
-          closeTime: safe(row.closeTime ?? null),
-          trades: safe(row.trades ?? row.n ?? null),
         };
       }
       return { openTime: null, open: null, high: null, low: null, close: null, volume: null };
@@ -125,7 +120,8 @@ module.exports = async function handler(req, res) {
       return arr.slice(arr.length - n);
     }
 
-    // Ensure ascending sort by openTime, dedupe by openTime, drop incomplete last bar if closeTime is in the future
+    // Ensure ascending sort by openTime, dedupe by openTime
+    // KEEP in-progress candles for real-time price calculation
     function finalizeCandles(rawArr) {
       if (!Array.isArray(rawArr)) return [];
       const arr = rawArr
@@ -140,12 +136,7 @@ module.exports = async function handler(req, res) {
         seen.add(ot);
         out.push(arr[i]);
       }
-      // drop last if it has a future closeTime (in-progress bar)
-      if (out.length) {
-        const last = out[out.length - 1];
-        const ct = last && last.closeTime != null ? Number(last.closeTime) : null;
-        if (ct != null && Number.isFinite(ct) && ct > Date.now()) out.pop();
-      }
+      // DO NOT drop in-progress candles - we need real-time price
       return out;
     }
 
@@ -162,6 +153,18 @@ module.exports = async function handler(req, res) {
       '4h': normalized['4h'].length,
       '1d': normalized['1d'].length,
     });
+
+    // Get the last closed 15m candle price (used for all calculations)
+    function getCurrentPrice() {
+      const candles15m = normalized['15m'] || [];
+      if (candles15m.length > 0) {
+        const last15m = candles15m[candles15m.length - 1];
+        if (last15m && last15m.close != null && Number.isFinite(last15m.close)) {
+          return last15m.close;
+        }
+      }
+      return null;
+    }
 
     // ---------- Indicator helpers ----------
     const toNum = (v) => (v == null ? null : Number(v));
@@ -398,7 +401,7 @@ module.exports = async function handler(req, res) {
 
     // ---------- Analysis per timeframe (swing optimized) ----------
     function analyzeTimeframe(tfName, candles) {
-      const result = { tf: tfName, indicators: {}, last: {}, score: 0, reasons: [], signal: 'HOLD' };
+      const result = { tf: tfName, indicators: {}, last: {}, score: 0, signal: 'HOLD' };
       const closes = candles.map(c => toNum(c.close));
       const highs = candles.map(c => toNum(c.high));
       const lows = candles.map(c => toNum(c.low));
@@ -427,28 +430,25 @@ module.exports = async function handler(req, res) {
         macd: macdObj.macdLine[i], macd_signal: macdObj.signalLine[i], macd_hist: macdObj.hist[i],
         atr14: atr14[i],
         supertrend: st[i],
-        bb_upper: null, bb_mid: null, bb_lower: null,
         vol_sma20: volSMA20[i], volume: volumes[i]
       };
 
-      // scoring rules tuned for swing bias
       let score = 0;
-      const sf = 1.0;
-      if (last.close != null && result.indicators.sma50 != null) score += (last.close > result.indicators.sma50 ? 6 : -6) * sf;
-      if (result.indicators.sma50 != null && result.indicators.sma200 != null) score += (result.indicators.sma50 > result.indicators.sma200 ? 10 : -10) * sf;
-      if (last.close != null && result.indicators.ema9 != null) score += (last.close > result.indicators.ema9 ? 5 : -5) * sf;
-      if (result.indicators.ema9 != null && result.indicators.ema21 != null) score += (result.indicators.ema9 > result.indicators.ema21 ? 3 : -3) * sf;
+      if (last.close != null && result.indicators.sma50 != null) score += (last.close > result.indicators.sma50 ? 6 : -6);
+      if (result.indicators.sma50 != null && result.indicators.sma200 != null) score += (result.indicators.sma50 > result.indicators.sma200 ? 10 : -10);
+      if (last.close != null && result.indicators.ema9 != null) score += (last.close > result.indicators.ema9 ? 5 : -5);
+      if (result.indicators.ema9 != null && result.indicators.ema21 != null) score += (result.indicators.ema9 > result.indicators.ema21 ? 3 : -3);
       if (result.indicators.macd != null && result.indicators.macd_signal != null && result.indicators.macd_hist != null) {
-        if (result.indicators.macd > result.indicators.macd_signal && result.indicators.macd_hist > 0) score += 12 * sf;
-        else if (result.indicators.macd < result.indicators.macd_signal && result.indicators.macd_hist < 0) score -= 12 * sf;
+        if (result.indicators.macd > result.indicators.macd_signal && result.indicators.macd_hist > 0) score += 12;
+        else if (result.indicators.macd < result.indicators.macd_signal && result.indicators.macd_hist < 0) score -= 12;
       }
-      if (result.indicators.supertrend != null && last.close != null) score += (last.close > result.indicators.supertrend ? 8 : -8) * sf;
+      if (result.indicators.supertrend != null && last.close != null) score += (last.close > result.indicators.supertrend ? 8 : -8);
       if (result.indicators.rsi14 != null) {
-        if (result.indicators.rsi14 < 30) score += 2 * sf; else if (result.indicators.rsi14 > 70) score -= 2 * sf;
+        if (result.indicators.rsi14 < 30) score += 2; else if (result.indicators.rsi14 > 70) score -= 2;
       }
       if (result.indicators.volume != null && result.indicators.vol_sma20 != null) {
-        if (result.indicators.volume > result.indicators.vol_sma20 * 1.3) score += 6 * sf;
-        else if (result.indicators.volume < result.indicators.vol_sma20 * 0.7) score -= 3 * sf;
+        if (result.indicators.volume > result.indicators.vol_sma20 * 1.3) score += 6;
+        else if (result.indicators.volume < result.indicators.vol_sma20 * 0.7) score -= 3;
       }
 
       result.score = Math.max(-200, Math.min(200, Math.round(score)));
@@ -465,10 +465,6 @@ module.exports = async function handler(req, res) {
     for (const tf of Object.keys(normalized)) {
       tfResults[tf] = analyzeTimeframe(tf, normalized[tf]);
     }
-
-    console.log('[swing] tfResults sample:', {
-      '1d_score': tfResults['1d']?.score, '4h_score': tfResults['4h']?.score, '1h_score': tfResults['1h']?.score
-    });
 
     // ---------- Voting / weights (swing) ----------
     // Timeframe roles:
@@ -494,51 +490,18 @@ module.exports = async function handler(req, res) {
     else if (sellWeight > buyWeight && sellWeight >= 4.0) final_signal = 'SELL';
     else final_signal = 'HOLD';
 
-    // Predefine flip-zone variables before debugging
+    const currentPrice = getCurrentPrice();
+    
     let flip_zone_price = null;
     let flip_zone_confidence = 0;
     let flip_zone_description = null;
 
-        // ---------- DEBUG LOGGING & optional flip-zone override ----------
-    try {
-      // Helpful logs to diagnose why final_signal is HOLD
-      console.log('[indicators][debug] tfResults summary:',
-        {
-          '15m_score': tfResults['15m']?.score,
-          '1h_score': tfResults['1h']?.score,
-          '4h_score': tfResults['4h']?.score,
-          '1d_score': tfResults['1d']?.score,
-          'final_signal_before': final_signal
-        }
-      );
-      console.log('[indicators][debug] last closes:',
-        {
-          '15m': tfResults['15m']?.last?.close,
-          '1h': tfResults['1h']?.last?.close,
-          '4h': tfResults['4h']?.last?.close,
-          '1d': tfResults['1d']?.last?.close
-        }
-      );
-      console.log('[indicators][debug] flip zone:',
-        { flip_zone_price, flip_zone_confidence }
-      );
-    } catch (e) {
-      console.log('[indicators][debug] logging error', e);
-    }
+    const OVERRIDE_CONFIDENCE = 0.60;
+    const OVERRIDE_MULTI_TF_COUNT = 2;
     
-    // OPTIONAL: Flip-zone override rules
-    // Configure these thresholds as you prefer:
-    const OVERRIDE_CONFIDENCE = 0.60;    // require >= 0.6 confidence
-    const OVERRIDE_MULTI_TF_COUNT = 2;   // require at least 2 higher TFs (1h/4h/1d) aligned with the flip direction
-    // Determine current mid price to compare to flip zone
-    let currentPrice = tfResults['1h']?.last?.close ?? tfResults['15m']?.last?.close ?? null;
-    
-    if (typeof flip_zone_price !== 'undefined' && flip_zone_price != null && typeof flip_zone_confidence !== 'undefined') {
-      // determine direction: if currentPrice < flip_zone_price => likely trending DOWN through flip zone
-      const dirFromFlip = currentPrice != null && currentPrice < flip_zone_price ? 'DOWN' : (currentPrice != null && currentPrice > flip_zone_price ? 'UP' : null);
-    
-      if (dirFromFlip && flip_zone_confidence >= OVERRIDE_CONFIDENCE && currentPrice != null) {
-        // count higher-tf alignment (1h, 4h, 1d)
+    if (flip_zone_price != null && flip_zone_confidence >= OVERRIDE_CONFIDENCE && currentPrice != null) {
+      const dirFromFlip = currentPrice < flip_zone_price ? 'DOWN' : (currentPrice > flip_zone_price ? 'UP' : null);
+      if (dirFromFlip) {
         let alignCount = 0;
         const checkTfAlign = (tf) => {
           const s = tfResults[tf]?.signal || 'HOLD';
@@ -549,31 +512,16 @@ module.exports = async function handler(req, res) {
         alignCount += checkTfAlign('1h');
         alignCount += checkTfAlign('4h');
         alignCount += checkTfAlign('1d');
-    
-        console.log('[indicators][debug] flip override candidate', { dirFromFlip, flip_zone_confidence, alignCount });
-    
         if (alignCount >= OVERRIDE_MULTI_TF_COUNT) {
-          // Overwrite final_signal conservatively
           if (dirFromFlip === 'DOWN') final_signal = 'STRONG SELL';
           else if (dirFromFlip === 'UP') final_signal = 'STRONG BUY';
-          console.log('[indicators][debug] final_signal OVERRIDDEN to', final_signal);
-        } else {
-          console.log('[indicators][debug] override conditions not met (alignCount < threshold)');
         }
       }
     }
     
-    console.log('[swing] voting:', { buyWeight, sellWeight, final_signal });
 
-    // ---------- ATR reference (4h) ----------
-    function pickAtr4h() {
-      const a4h = tfResults['4h']?.indicators?.atr14 ?? null;
-      return a4h != null ? a4h : null;
-    }
-    let atrRef = pickAtr4h();
-    const fallbackPrice = tfResults['4h']?.last?.close ?? tfResults['1h']?.last?.close ?? tfResults['15m']?.last?.close ?? null;
-    // Percent-of-price fallback only; no absolute floors
-    if (atrRef == null && fallbackPrice != null) atrRef = fallbackPrice * 0.003;
+    let atrRef = tfResults['4h']?.indicators?.atr14 ?? null;
+    if (atrRef == null && currentPrice != null) atrRef = currentPrice * 0.003;
 
     // ---------- Swing structure & Fibonacci projections ----------
     // Prefer 4h for swing structure, fallback to 1h then 15m
@@ -669,64 +617,43 @@ module.exports = async function handler(req, res) {
       // For swing trading: prefer time-confirmed BOS, but allow recent breaks if other validations are strong
       // However, if break happened less than 1 candle ago, it's too fresh - wait for confirmation
       if (candlesAfterBreak < 1) return null;
-      
-      // VALIDATION 2: Volume confirmation on break candle
-      // Break candle should have volume > 1.5x average volume
       const tfResult = tfResults[tfName];
       const avgVolume = tfResult?.indicators?.vol_sma20;
       const breakVolume = volumes[breakCandleIdx];
+      const volumeRatio = (Number.isFinite(avgVolume) && Number.isFinite(breakVolume) && avgVolume > 0) 
+        ? breakVolume / avgVolume 
+        : null;
       
-      if (Number.isFinite(avgVolume) && Number.isFinite(breakVolume)) {
-        const volumeRatio = avgVolume > 0 ? breakVolume / avgVolume : 0;
-        if (volumeRatio < 1.5) {
-          // Volume too low - BOS may be false
-          // Don't reject completely, but mark as weak
-        }
-      }
-      
-      // VALIDATION 3: Higher timeframe alignment (1D trend)
-      // BOS should align with 1D trend direction
       const tf1d = tfResults['1d'];
       let htfAligned = true;
-      
       if (tf1d) {
         const price1d = tf1d.last?.close;
         const ema21_1d = tf1d.indicators?.ema21;
         const rsi14_1d = tf1d.indicators?.rsi14;
-        
         if (Number.isFinite(price1d) && Number.isFinite(ema21_1d)) {
           if (dir === 'UP') {
-            // UP BOS should align with bullish 1D trend
             if (price1d < ema21_1d) htfAligned = false;
             if (Number.isFinite(rsi14_1d) && rsi14_1d < 50) htfAligned = false;
           } else {
-            // DOWN BOS should align with bearish 1D trend
             if (price1d > ema21_1d) htfAligned = false;
             if (Number.isFinite(rsi14_1d) && rsi14_1d > 50) htfAligned = false;
           }
         }
       }
-      
-      // If HTF not aligned, reject BOS (critical validation)
       if (!htfAligned) return null;
       
-      // VALIDATION 4: Liquidity sweep detection
-      // Check if liquidity was swept before BOS (price extended beyond structure with wick)
       let liquiditySwept = false;
       const lookbackForSweep = Math.min(10, breakCandleIdx);
-      
       if (dir === 'UP') {
-        // For UP BOS, check if price swept swing low (liquidity below) before breaking high
         for (let k = Math.max(0, breakCandleIdx - lookbackForSweep); k < breakCandleIdx; k++) {
-          if (lows[k] < lastLowVal * 0.999) { // 0.1% tolerance for wick extension
+          if (lows[k] < lastLowVal * 0.999) {
             liquiditySwept = true;
             break;
           }
         }
       } else {
-        // For DOWN BOS, check if price swept swing high (liquidity above) before breaking low
         for (let k = Math.max(0, breakCandleIdx - lookbackForSweep); k < breakCandleIdx; k++) {
-          if (highs[k] > lastHighVal * 1.001) { // 0.1% tolerance for wick extension
+          if (highs[k] > lastHighVal * 1.001) {
             liquiditySwept = true;
             break;
           }
@@ -754,11 +681,6 @@ module.exports = async function handler(req, res) {
       if (!Number.isFinite(low) || !Number.isFinite(high) || startIdx == null || endIdx == null) {
         return null;
       }
-      
-      // Calculate volume ratio for confidence scoring
-      const volumeRatio = (Number.isFinite(avgVolume) && Number.isFinite(breakVolume) && avgVolume > 0) 
-        ? breakVolume / avgVolume 
-        : null;
       
       return { 
         dir, 
@@ -823,16 +745,14 @@ module.exports = async function handler(req, res) {
     }
 
     let impulse =
-      dominantImpulseFromSwings(swings4h, atrRef, fallbackPrice) ||
-      dominantImpulseFromSwings(swings1h, atrRef, fallbackPrice) ||
-      dominantImpulseFromSwings(swings15, atrRef, fallbackPrice) ||
+      dominantImpulseFromSwings(swings4h, atrRef, currentPrice) ||
+      dominantImpulseFromSwings(swings1h, atrRef, currentPrice) ||
+      dominantImpulseFromSwings(swings15, atrRef, currentPrice) ||
       null;
-    // Prefer BOS impulse when available
     if (bos && Number.isFinite(bos.low) && Number.isFinite(bos.high)) {
       impulse = { dir: bos.dir, low: bos.low, high: bos.high, start: bos.startIdx, end: bos.endIdx };
     }
 
-    // compute fib extension/projection for that impulse
     function computeFibForImpulse(imp) {
       if (!imp || imp.low == null || imp.high == null) return null;
       const high = imp.high, low = imp.low;
@@ -865,15 +785,10 @@ module.exports = async function handler(req, res) {
 
     const fib = computeFibForImpulse(impulse);
 
-    // determine flip-zone candidates:
-    // If direction is UP, flip zone = extension area beyond high (ext1382/1618) OR retracement zone 0.5-0.618 for pullback entries.
-    // We'll compute distances from current price to these levels and produce confidence.
-    currentPrice = fallbackPrice;
     flip_zone_confidence = 0;
     flip_zone_description = null;
     flip_zone_price = null;
     if (fib && currentPrice != null) {
-      // closeness scoring: nearer levels => higher confidence that flip could happen there
       function closenessScore(level) {
         if (!Number.isFinite(level) || level === 0) return 0;
         const pct = Math.abs((currentPrice - level) / level);
@@ -947,19 +862,13 @@ module.exports = async function handler(req, res) {
           if (fib.dir === 'UP') { flip_zone_action = 'SHORT'; direction_after_flip = 'SELL'; }
           else { flip_zone_action = 'LONG'; direction_after_flip = 'BUY'; }
         }
-        // stash for reasons output
         var _flip_meta = {
           low: best.low, high: best.high, action: flip_zone_action, direction_after_flip,
           type: best.type, name: best.name
         };
-        // also keep top candidates (up to 4) for transparency
-        var _flip_candidates = candidates.slice(0, 4).map(c => ({
-          name: c.name, type: c.type, low: c.low, high: c.high, combined: Number(c.combined?.toFixed(3) || 0)
-        }));
       }
     }
 
-    console.log('[swing] fib & flip:', { fibExists: !!fib, flip_zone_confidence, flip_zone_description });
 
     // ---------- Multi-impulse confluence (golden pocket + 0.714 focus) ----------
     function buildImpulseList(sw) {
@@ -1212,7 +1121,7 @@ module.exports = async function handler(req, res) {
 
     // Score hot zones with order block and FVG weighting
     function scoreHotZone(z) {
-      const a = Number.isFinite(atrRef) ? atrRef : (fallbackPrice*0.003);
+      const a = Number.isFinite(atrRef) ? atrRef : (currentPrice*0.003);
       const width = Math.max(1e-9, z.high - z.low);
       const widthScore = Math.max(0, 1 - (width / (a*1.2))); // narrower zones get higher score
       // Structure proximity: distance to nearest 4h swing high/low price
@@ -1255,7 +1164,7 @@ module.exports = async function handler(req, res) {
                 : tfResults['1h']?.last?.close ? '1h'
                 : tfResults['15m']?.last?.close ? '15m' : '4h';
     const ref = tfResults[refTf];
-    const lastClose = ref?.last?.close ?? fallbackPrice;
+    const lastClose = currentPrice ?? (ref?.last?.close ?? null);
 
     // structure-based levels: nearest swing support/resistance
     const lowsPool =
@@ -1984,7 +1893,7 @@ module.exports = async function handler(req, res) {
         breakeven_after_tp1: true, // Move SL to breakeven after TP1 hit
         trail_stop_after_tp1: true // Trail stop using 4H swing structure after TP1
       };
-      
+
       suggestions[lvl] = {
         entry: qEntry,
         entry_range: { low: qBandLow, high: qBandHigh },
@@ -2124,7 +2033,7 @@ module.exports = async function handler(req, res) {
     if (flags.zone_quality && bestHot) {
       let bonus = 0;
       const mid = (bestHot.low + bestHot.high) / 2;
-      const a = Number.isFinite(atrRef) ? atrRef : ((fallbackPrice ?? 0) * 0.003);
+      const a = Number.isFinite(atrRef) ? atrRef : ((currentPrice ?? 0) * 0.003);
       const eps = a * 0.2;
       function addBonusFrom(arr) {
         let eq=0, wick=0;
@@ -2241,9 +2150,7 @@ module.exports = async function handler(req, res) {
         return true;
       } catch { return false; }
     }
-    // bestHot and bestDir already declared earlier (after scoredHot)
     const zoneReady = bestDir ? (flags.ltf_stability ? ltfConfirm1hStable(bestDir) : ltfConfirm(bestDir)) : false;
-    // Position size factor
     const sizeFactor = clamp01(
       (bestHot?.score ?? 0) * 0.6 +
       (entry_confidence) * 0.25 +
@@ -2328,8 +2235,6 @@ module.exports = async function handler(req, res) {
       } catch {}
     }
 
-    // ---------- Compose final output (structure preserved) ----------
-    // New concise, trader-focused schema
     function mapBias(sig) {
       if (sig.includes('STRONG BUY') || sig === 'BUY') return 'BUY';
       if (sig.includes('STRONG SELL') || sig === 'SELL') return 'SELL';
@@ -2383,9 +2288,8 @@ module.exports = async function handler(req, res) {
       profit_taking_strategy: suggestions.level1.profit_taking_strategy,
       atr_used: suggestions.level1.atr_used
     };
-    // Safeguards gate for live readiness
-    const pad = Number.isFinite(atrRef) ? atrRef * padMul : ((fallbackPrice ?? 0) * 0.0006);
-    const lp = fallbackPrice ?? null;
+    const pad = Number.isFinite(atrRef) ? atrRef * padMul : ((currentPrice ?? 0) * 0.0006);
+    const lp = currentPrice ?? null;
     const zoneWithin = (primaryZone && lp != null)
       ? (lp >= (primaryZone.range_low - pad) && lp <= (primaryZone.range_high + pad))
       : false;
@@ -2490,11 +2394,14 @@ module.exports = async function handler(req, res) {
     const bias_conf_pretty  = `${signal_confidence.toFixed(3)} (${bias_conf_label})`;
     const entry_conf_pretty = `${entry_confidence.toFixed(3)} (${entry_conf_label})`;
     const flip_conf_pretty  = `${(flip_zone_confidence ?? 0).toFixed(3)} (${flip_conf_label})`;
+    
+    const last_price = currentPrice;
+    
     const output = {
       symbol: symbol || null,
       exchangeSymbol: exchangeSymbol || null,
       timestamp: normalized['4h']?.[normalized['4h'].length-1]?.openTime ?? null,
-      last_price: fallbackPrice ?? null,
+      last_price: last_price ?? null,
       tf_used: '4h',
       bias,
       bias_confidence: Number(signal_confidence.toFixed(3)),
@@ -2520,7 +2427,6 @@ module.exports = async function handler(req, res) {
       structure
     };
 
-    // Telemetry sampling (when instrumentation)
     if (flags.instrumentation && Math.random() < 0.2) {
       console.log('[swing][instrumentation] readiness', {
         symbol,
@@ -2536,7 +2442,6 @@ module.exports = async function handler(req, res) {
         regime: regimeContext
       });
     }
-    console.log('[swing] final output signal=', final_signal);
     return res.status(200).json(output);
 
   } catch (err) {
