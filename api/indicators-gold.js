@@ -418,6 +418,8 @@ module.exports = async function handler(req, res) {
     let tp1 = null;
     let tp2 = null;
     let rDistance = null;
+    let entryRangeLow = null;
+    let entryRangeHigh = null;
 
     if (tradeDirection && Number.isFinite(lastPrice) && Number.isFinite(atr4h)) {
       entryPrice = lastPrice;
@@ -436,6 +438,56 @@ module.exports = async function handler(req, res) {
           tp1 = entryPrice - 1.3 * rDistance;
           tp2 = entryPrice - 2.0 * rDistance;
         }
+      }
+
+      // Entry price range: value zone around 1h EMAs, padded by 4h ATR
+      // For longs, typical professional approach: buy between EMA50_1h and EMA20_1h,
+      // with a volatility buffer; for shorts, mirror that zone.
+      const a = atr4h;
+      if (Number.isFinite(a)) {
+        let zoneLow;
+        let zoneHigh;
+        if (tradeDirection === 'UP') {
+          const baseLow = Number.isFinite(ema50_1h) ? ema50_1h : (Number.isFinite(ema20_1h) ? ema20_1h : entryPrice);
+          const baseHigh = Number.isFinite(ema20_1h) ? ema20_1h : entryPrice;
+          zoneLow = Math.min(baseLow, baseHigh);
+          zoneHigh = Math.max(baseLow, baseHigh);
+        } else {
+          const baseLow = Number.isFinite(ema20_1h) ? ema20_1h : entryPrice;
+          const baseHigh = Number.isFinite(ema50_1h) ? ema50_1h : (Number.isFinite(ema20_1h) ? ema20_1h : entryPrice);
+          zoneLow = Math.min(baseLow, baseHigh);
+          zoneHigh = Math.max(baseLow, baseHigh);
+        }
+
+        const pad = 0.25 * a; // ~quarter ATR padding around value zone
+        let bandLow = zoneLow - pad;
+        let bandHigh = zoneHigh + pad;
+
+        // Ensure entry lies within or very close to the band
+        const tightenPad = 0.1 * a;
+        if (entryPrice < bandLow) bandLow = entryPrice - tightenPad;
+        if (entryPrice > bandHigh) bandHigh = entryPrice + tightenPad;
+
+        // Control band width relative to ATR (min 0.2 ATR, max 0.8 ATR)
+        const minW = 0.2 * a;
+        const maxW = 0.8 * a;
+        let width = bandHigh - bandLow;
+        if (!Number.isFinite(width) || width <= 0) {
+          bandLow = entryPrice - minW / 2;
+          bandHigh = entryPrice + minW / 2;
+          width = bandHigh - bandLow;
+        } else if (width < minW) {
+          const mid = (bandLow + bandHigh) / 2;
+          bandLow = mid - minW / 2;
+          bandHigh = mid + minW / 2;
+        } else if (width > maxW) {
+          // Shrink band around entry to stay focused
+          bandLow = entryPrice - maxW / 2;
+          bandHigh = entryPrice + maxW / 2;
+        }
+
+        entryRangeLow = bandLow;
+        entryRangeHigh = bandHigh;
       }
     }
 
@@ -470,6 +522,9 @@ module.exports = async function handler(req, res) {
       ? {
           side: finalSignal, // STRONG BUY/BUY/SELL/STRONG SELL
           entry: entryPrice,
+          entry_range: Number.isFinite(entryRangeLow) && Number.isFinite(entryRangeHigh)
+            ? { low: entryRangeLow, high: entryRangeHigh }
+            : null,
           stop_loss: sl,
           take_profit_1: tp1,
           take_profit_2: tp2,
@@ -514,6 +569,9 @@ module.exports = async function handler(req, res) {
       execute_order: !!executeOrder,
 
       entry_price: Number.isFinite(entryPrice) ? entryPrice : null,
+      entry_price_range: Number.isFinite(entryRangeLow) && Number.isFinite(entryRangeHigh)
+        ? { low: entryRangeLow, high: entryRangeHigh }
+        : null,
       stop_loss: Number.isFinite(sl) ? sl : null,
       take_profit_1: Number.isFinite(tp1) ? tp1 : null,
       take_profit_2: Number.isFinite(tp2) ? tp2 : null,
