@@ -43,28 +43,40 @@ function normalizeCandleRow(row) {
   if (!row) {
     return { openTime: null, open: null, high: null, low: null, close: null, volume: null };
   }
-  const safe = (v) => {
+  const safeNum = (v) => {
     if (v === undefined || v === null) return null;
     const n = Number(v);
     return Number.isNaN(n) ? null : n;
   };
+  const safeTime = (v) => {
+    if (v === undefined || v === null) return null;
+    // If it's already a number, use it
+    if (typeof v === 'number') return Number.isFinite(v) ? v : null;
+    // Try numeric string first
+    const asNum = Number(v);
+    if (!Number.isNaN(asNum)) return asNum;
+    // Fallback: try Date parsing (for "2025-11-24 20:15:00" etc.)
+    const parsed = Date.parse(v);
+    return Number.isNaN(parsed) ? null : parsed;
+  };
   if (Array.isArray(row)) {
     return {
-      openTime: safe(row[0]),
-      open: safe(row[1]),
-      high: safe(row[2]),
-      low: safe(row[3]),
-      close: safe(row[4]),
-      volume: safe(row[5]),
+      openTime: safeTime(row[0]),
+      open: safeNum(row[1]),
+      high: safeNum(row[2]),
+      low: safeNum(row[3]),
+      close: safeNum(row[4]),
+      volume: safeNum(row[5]),
     };
   } else if (typeof row === 'object') {
     return {
-      openTime: safe(row.openTime ?? row.t ?? row.time ?? row.timestamp ?? null),
-      open: safe(row.open ?? row.o ?? row.price ?? null),
-      high: safe(row.high ?? row.h ?? null),
-      low: safe(row.low ?? row.l ?? null),
-      close: safe(row.close ?? row.c ?? null),
-      volume: safe(row.volume ?? row.v ?? null),
+      // Accept multiple time keys, including your "datetime"
+      openTime: safeTime(row.openTime ?? row.t ?? row.time ?? row.timestamp ?? row.datetime ?? null),
+      open: safeNum(row.open ?? row.o ?? row.price ?? null),
+      high: safeNum(row.high ?? row.h ?? null),
+      low: safeNum(row.low ?? row.l ?? null),
+      close: safeNum(row.close ?? row.c ?? null),
+      volume: safeNum(row.volume ?? row.v ?? null),
     };
   }
   return { openTime: null, open: null, high: null, low: null, close: null, volume: null };
