@@ -413,13 +413,14 @@ module.exports = async function handler(req, res) {
 
     // ---------- SL / TP construction ----------
     const atr4h = Number.isFinite(tf4h.atr14) ? tf4h.atr14 : null;
-    let entryPrice = lastPrice;
+    let entryPrice = null;
     let sl = null;
     let tp1 = null;
     let tp2 = null;
     let rDistance = null;
 
-    if (tradeDirection && Number.isFinite(entryPrice) && Number.isFinite(atr4h)) {
+    if (tradeDirection && Number.isFinite(lastPrice) && Number.isFinite(atr4h)) {
+      entryPrice = lastPrice;
       const slDist = 1.5 * atr4h; // 1.5x ATR(4H)
       if (tradeDirection === 'UP') {
         sl = entryPrice - slDist;
@@ -450,7 +451,8 @@ module.exports = async function handler(req, res) {
         finalSignalConfidence = 0.7;
       }
     } else {
-      finalSignalConfidence = biasConfidence * 0.5;
+      // No active trade setup; confidence just reflects bias quality
+      finalSignalConfidence = biasConfidence;
     }
 
     const finalSignal = finalSignalLabel(tradeDirection, finalSignalConfidence);
