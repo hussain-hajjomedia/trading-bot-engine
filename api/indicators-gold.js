@@ -26,7 +26,19 @@ function extractArrayFromPossibleWrapper(x) {
 
 function parseInputField(field) {
   const p = tryParseMaybeJson(field);
-  return extractArrayFromPossibleWrapper(p);
+  let arr = extractArrayFromPossibleWrapper(p);
+
+  // Special handling for AlphaVantage-style wrapper you use for gold:
+  // kline_15m / 1h / 4h / 1d are like:
+  // [ { meta: {...}, values: [ { datetime, open, high, low, close }, ... ], status: "ok" } ]
+  if (Array.isArray(arr) && arr.length > 0) {
+    const first = arr[0];
+    if (first && typeof first === 'object' && Array.isArray(first.values)) {
+      return first.values;
+    }
+  }
+
+  return arr;
 }
 
 function chunkFlatNumericArray(arr, fields = BINANCE_FIELDS) {
