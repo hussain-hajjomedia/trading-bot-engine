@@ -484,6 +484,18 @@ module.exports = async function handler(req, res) {
         }
       : null;
 
+    // Map numeric confidence to low/medium/high label
+    function confidenceLabel(x) {
+      const v = Number(x);
+      if (!Number.isFinite(v)) return 'low';
+      if (v >= 0.7) return 'high';
+      if (v >= 0.4) return 'medium';
+      return 'low';
+    }
+
+    const biasConfLabel = confidenceLabel(biasConfidence);
+    const finalConfLabel = confidenceLabel(finalSignalConfidence);
+
     const output = {
       symbol: symbol || 'XAUUSD',
       timestamp: normalized['4h']?.[normalized['4h'].length - 1]?.openTime ?? null,
@@ -491,13 +503,14 @@ module.exports = async function handler(req, res) {
       tf_used: '15m',
 
       bias,
-      bias_confidence: Number(biasConfidence.toFixed(3)),
+      // Include both numeric and label in the same string as requested
+      bias_confidence: `${biasConfidence.toFixed(3)} (${biasConfLabel})`,
       trend_4h: trend4h,
       align_1h: align1h,
       rsi_1h: Number.isFinite(rsi1h) ? Number(rsi1h.toFixed(2)) : null,
 
       final_signal: finalSignal,
-      final_signal_confidence: Number(finalSignalConfidence.toFixed(3)),
+      final_signal_confidence: `${finalSignalConfidence.toFixed(3)} (${finalConfLabel})`,
       execute_order: !!executeOrder,
 
       entry_price: Number.isFinite(entryPrice) ? entryPrice : null,
