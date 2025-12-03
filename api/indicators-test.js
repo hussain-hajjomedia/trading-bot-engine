@@ -650,6 +650,7 @@ module.exports = async function handler(req, res) {
       stop_loss: qSL,
       take_profit_1: qTP1,
       take_profit_2: qTP2,
+      market_structure: marketStructure, // 'bullish' | 'bearish' | 'range' | 'neutral' (4h swing view)
     };
 
     return res.status(200).json(output);
