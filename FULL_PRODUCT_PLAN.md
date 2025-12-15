@@ -1,6 +1,7 @@
 ## 1. Product Goals & Core Value
 
 - **Primary goal**: Help users consistently execute high-quality trades in crypto and gold using the engine, with **clear, actionable signals** and **excellent UX**.
+- **Quality bar**: Every surfaced signal must pass deterministic guardrails (data freshness, liquidity/spread sanity, minimum R:R, volatility regime fit) and be explainable; unqualified signals are never shown.
 - **Main features for v1**:
   - **Account & Auth**: Secure signup/login, email/password + optional OAuth, password reset.
   - **Signal Engine Integration**: Use existing indicators & logic to generate:
@@ -45,6 +46,8 @@
     - Write a short internal spec:
       - Supported instruments, timeframes, and the exact strategies to expose.
       - Risk management defaults (risk per trade, RR minimums).
+      - Define the **signal playbook**: confluence rules (HTF bias + LTF trigger + volume/liquidity filter), entry/SL anchoring, TP laddering, invalidation conditions, and news/session filters.
+      - Set **acceptance criteria**: min 2.0 R:R, max spread % of entry, allowed slippage tolerance, required data freshness (<30s live, <5m historical), duplication suppression window, and when to suppress signals (abnormal volatility/news).
     - Map the existing `api/indicators*.js`:
       - Identify what functions produce signals (input/output shape).
       - Decide which indicators/strategies are included in v1.
@@ -121,20 +124,29 @@
     - Implement a small data module:
       - REST client for historical candles (Klines).
       - WebSocket client for live ticks/candles for selected pairs.
-    - Define a canonical OHLCV structure your engine expects.
+    - Define a canonical OHLCV structure your engine expects (with spread, volume, and latency metadata).
+    - Add **data quality checks**: freshness thresholds, missing candle detection, volume spikes outlier rejection, and fallback to REST on WS gaps.
   - **TwelveData integration**:
     - Implement client for gold (XAUUSD or equivalent).
     - Fetch intraday candles (e.g., 1m/5m/15m).
   - **Engine wiring**:
     - Create a `signal-engine` service (Node module) that:
-      - Takes OHLCV data as input.
-      - Calls your existing `indicators*.js` functions.
-      - Produces one or more `Signal` objects (entry, SL, TP1–TP3, direction, etc.).
+      - Takes OHLCV data as input (multi-timeframe batches).
+      - Derives **HTF bias** (e.g., 4h/1h structure) and **LTF trigger** (5m/15m).
+      - Applies liquidity/volatility filters (min volume, max spread %, ATR regime fit) and session/news filters.
+      - Calls your existing `indicators*.js` functions as pure, deterministic functions.
+      - Produces one or more `Signal` objects (entry, SL, TP1–TP3, direction, etc.) with **R:R ≥ 2.0**, confluence score, data_quality score, and invalidation criteria.
+      - Deduplicates signals by instrument/timeframe/strategy within a suppression window.
+    - Add **slippage-aware sizing helper**: compute position size using user risk %, distance to SL, and conservative slippage buffer.
+    - Add **cooldown/suppression** rules: skip signals if spread > threshold, latency > threshold, or during high-impact events (stubbed feed).
     - Add a background job (cron-like) to:
       - Periodically fetch the latest data (e.g., every minute).
       - Run the engine for:
         - Each instrument/timeframe combo you support.
       - Upsert new signals into the `signals` table.
+  - **Backtesting & validation**:
+    - Run fast backtests on recent data per instrument/timeframe to confirm win rate, R:R distribution, and drawdown before enabling live generation.
+    - Log validation metrics and store `engine_version` + `backtest_id` on produced signals.
   - **Basic verification**:
     - Seed DB with a few historical signals (from backtest or manual).
 
@@ -200,6 +212,7 @@
     - Implement basic logic to compute trade PnL from historical price data or manual input.
     - Fill `SignalOutcome` entries for completed signals:
       - Which TP/SL was hit.
+    - Validate PnL using canonical OHLCV feed with slippage/spread assumptions; flag inconsistent self-reported fills.
   - **Stats endpoints**:
     - `/api/stats/overview`:
       - Win rate, avg RR, total PnL, number of trades.
@@ -373,18 +386,45 @@
     - Symbol: XAUUSD or equivalent via TwelveData.
     - Data: TwelveData intraday (1m/5m/15m) + daily.
 
-- **Strategies (example structure)**:
-  - **Trend-following**: combine moving averages + higher timeframe confirmation.
-  - **Mean reversion**: RSI, Bollinger Bands.
-  - **Breakout**: price crossing key levels + volume spikes.
-  - Your existing `indicators*.js` files will encapsulate the above logic.
+- **Trading principles (aligned with top discretionary/quant playbooks)**:
+  - **HTF bias + LTF trigger**: Only trade in the direction of 4h/1h structure; require 5m/15m trigger (break/retest, momentum cross, or mean-reversion reclaim).
+  - **Structure + S/R anchoring**: Entries anchored to clear levels (previous highs/lows, VWAP/200MA bands, daily open), with SL beyond invalidation not just ATR multiples.
+  - **Volume & liquidity filter**: Minimum rolling volume, max spread % of entry, and orderbook stability; suppress signals during illiquid conditions.
+  - **Volatility regime**: Use ATR percentile to decide strategy: trend/breakout in high-vol, mean reversion in low/normal vol; suppress if ATR is extreme.
+  - **Session & news filter**: Prefer liquid sessions (e.g., London/NY overlap for BTC); suppress around scheduled high-impact events (stubbed feed in v1).
+  - **Confluence requirement**: At least two confirming signals (e.g., HTF trend + LTF momentum + volume spike) and no conflicting signal on higher TF.
+  - **R:R discipline**: Do not emit signals with modeled R:R < 2.0 after including conservative slippage/spread.
+  - **Invalidation clarity**: Each signal carries explicit invalidation conditions (level break, time expiry, volatility breach).
+
+- **Signal acceptance & quality gates**:
+  - Data freshness: live <30s old; historical sync within 1–5m; drop stale data.
+  - Liquidity: spread < threshold (pair-specific), min volume over last N bars.
+  - Volatility: ATR within configured band; skip anomalous spikes.
+  - Uniqueness: suppress duplicate signals for the same instrument/strategy within a cooldown window.
+  - Risk: enforce min 2.0 R:R with SL at structure/ATR-based invalidation; TP ladder (TP1 ≈ 1–1.2R, TP2 ≈ 2R, TP3 ≈ 3R+).
+  - Max concurrent signals per instrument to avoid overexposure.
+
+- **Entry/SL/TP construction**:
+  - Entry: limit order at retest of level or breakout retest; include slippage buffer.
+  - SL: beyond invalidation level and ≥ k * ATR (k calibrated per strategy); hard cap on distance to avoid ultra-wide stops.
+  - TP ladder: TP1 for partials and move SL to breakeven; TP2 capture core R:R; TP3 runner; optional time-based close if no TP hit by expiry.
+
+- **Scoring & confidence**:
+  - Confluence score from weighted factors: HTF alignment, trigger quality, volume, volatility fit, structure cleanliness.
+  - Quality score from data integrity: freshness, spread, missing bars, and indicator agreement.
+  - Only publish signals above configurable score thresholds; store reasons when suppressed.
 
 - **Risk Management (recommended defaults)**:
-  - **Risk per trade**: 0.5–2% of account equity.
-  - **RR**: minimum 1.5–2.0 R per trade.
+  - **Risk per trade**: 0.5–1.5% of account equity (cap at 2%).
+  - **RR**: minimum 2.0 R per trade after slippage/spread adjustment.
   - **Position sizing** formula:
-    - Position size \( = \frac{\text{Account Equity} \times \text{Risk %}}{|\text{Entry} - \text{StopLoss}|} \)
-  - These parameters become **user-configurable profile settings**.
+    - Position size \( = \frac{\text{Account Equity} \times \text{Risk %}}{|\text{Entry} - \text{StopLoss}| + \text{slippage buffer}} \)
+  - Profile-based sizing presets (conservative/balanced/aggressive) and guardrails for leverage use.
+
+- **Validation & ongoing QA**:
+  - Backtest each strategy per instrument/timeframe with walk-forward split; record win rate, average R, max DD, and sample size.
+  - Forward-test (paper) before enabling live signals; disable automatically if live KPIs degrade (e.g., win rate over rolling 50 trades < threshold).
+  - Store `engine_version`, `backtest_id`, and `qa_status` on every signal for traceability.
 
 ---
 
@@ -410,14 +450,19 @@
     - `direction` (`long` | `short` | `buy` | `sell`)
     - `entry_price`, `stop_loss`
     - `take_profit_1`, `take_profit_2`, `take_profit_3`
-    - `confidence_score` (0–1 or 0–100)
-    - `created_at`, `valid_until`
+    - `rr_expected`, `confidence_score`, `confluence_score`, `quality_score`
+    - `volatility_regime`, `spread_bps`, `data_freshness_ms`
+    - `invalidation_reason`, `valid_until`
+    - `qa_status` (`backtested`, `paper`, `live`), `backtest_id`
     - `engine_version`, `strategy_id`
   - **`signal_outcomes`**
     - `signal_id` (FK)
     - `tp_hit` (`0`, `1`, `2`, `3`)
     - `sl_hit` (boolean)
+    - `exit_reason` (`tp`, `sl`, `manual`, `expiry`)
     - `max_favorable_excursion`, `max_adverse_excursion`
+    - `slippage_realized`, `fees_paid`
+    - `data_quality_flags`
     - `closed_at`
   - **`user_trades`** (how the user interacts with signals)
     - `id`, `user_id`, `signal_id`
@@ -437,6 +482,11 @@
     - `object_id`
     - `embedding` (vector)
     - `metadata` (JSONB)
+  - **`data_feed_events`** (optional for observability)
+    - `id`, `source` (`binance_ws`, `binance_rest`, `twelvedata`)
+    - `event_type` (`gap`, `stale`, `outlier_filtered`, `recovered`)
+    - `symbol`, `timeframe`, `latency_ms`, `spread_bps`
+    - `created_at`
 
 - **Time-series OHLCV data**:
   - Option A: Store full candles in **TimescaleDB** (tables like `ohlcv_crypto`, `ohlcv_gold`).
@@ -457,12 +507,15 @@
 
 - **Signals & trades**:
   - `GET /api/signals`
-    - Query params: `instrument`, `timeframe`, `status` (`open`, `recent`, `all`), pagination.
+    - Query params: `instrument`, `timeframe`, `status` (`open`, `recent`, `all`), `min_rr`, `min_confidence`, `min_quality`, pagination.
   - `GET /api/signals/:id`
+  - `GET /api/signals/:id/outcome`
   - `POST /api/user-trades`
     - Body: `signal_id`, `entry_price`, `position_size`, `note`.
   - `GET /api/user-trades`
   - `GET /api/user-trades/:id`
+  - `GET /api/engine/health`
+    - Returns data freshness, WS/REST status, and last signal timestamp per instrument.
 
 - **Stats & analytics**:
   - `GET /api/stats/overview`
@@ -481,6 +534,7 @@
 - **Market data**:
   - `GET /api/market/price?symbol=BTCUSDT`
   - `GET /api/market/chart?symbol=BTCUSDT&timeframe=1h&limit=200`
+  - `GET /api/market/health` (data latency, gaps, spread snapshot)
 
 ---
 
@@ -544,6 +598,33 @@
   - More advanced AI:
     - Personalized coaching.
     - Trade journal auto-analysis and mistake detection.
+
+---
+
+## 10. Backend Signal Workflow & Operational Guardrails
+
+- **End-to-end pipeline**:
+  - Ingest live + historical OHLCV (WS primary, REST fallback) with freshness checks.
+  - Validate data (missing bars, outliers, spread/latency thresholds); mark `data_quality`.
+  - Compute features: HTF structure/bias, LTF triggers, ATR regime, volume/spread stats, session label.
+  - Run strategy modules (pure functions) returning candidate setups with rationale.
+  - Apply confluence scoring and quality scoring; drop candidates below thresholds.
+  - Enforce acceptance rules: R:R ≥ 2.0 after slippage buffer, liquidity/vol filters, cooldown/dup suppression, news/session rules.
+  - Compute entry/SL/TP ladder, `rr_expected`, `invalidation_reason`; store with `engine_version`, `backtest_id`, `qa_status`.
+  - Publish to DB and cache; notify frontend via API with only QA-approved signals.
+
+- **Operational safeguards**:
+  - Circuit breakers: pause publishing if data freshness fails, if spread/vol exceeds limits, or if win rate over rolling window drops below threshold.
+  - Health endpoints: expose feed status, last candle time, and last signal time per instrument.
+  - Observability: structured logs for every decision (kept/filtered) and metrics (latency, win rate, avg R, DD).
+  - Rate limits on auth, signals, and AI routes; RBAC for admin/ops actions (pause engine, re-run backfill).
+  - Kill switch and manual overrides to unpublish or expire signals.
+
+- **Testing & QA**:
+  - Backtest with walk-forward split; forward-test in paper mode; promote to live only after hitting KPI gates (min win rate, min sample size, max DD).
+  - Canary rollout: enable per-instrument and monitor live KPIs before broad enablement.
+  - Regression tests for strategy functions, data mappers, and sizing helpers; golden-file tests for sample signals.
+
 
 
 
