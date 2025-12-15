@@ -1,6 +1,7 @@
 // api/new_indicator-crypto.js
 // Crypto Trading Strategy Engine
 // Implements strict market structure (valid swings), supply/demand zones, and R:R filtering.
+// Follows strictly instructions/crypto_strategy.md
 
 module.exports = async function handler(req, res) {
   if (req.method !== 'POST') {
@@ -13,7 +14,7 @@ module.exports = async function handler(req, res) {
     let { symbol, kline_15m, kline_1h, kline_4h, kline_1d } = payload;
 
     // --------------------------------------------------------------------------
-    // 1. INPUT PARSING & NORMALIZATION (Matching api/indicators.js)
+    // 1. INPUT PARSING & NORMALIZATION
     // --------------------------------------------------------------------------
     function tryParseMaybeJson(input) {
       if (input === undefined || input === null) return null;
@@ -101,7 +102,6 @@ module.exports = async function handler(req, res) {
       if (!Array.isArray(rawArr)) return [];
       const arr = rawArr.filter(c => c && c.openTime != null && Number.isFinite(c.close));
       arr.sort((a, b) => a.openTime - b.openTime);
-      // Dedupe
       const out = [];
       const seen = new Set();
       for (const c of arr) {
@@ -158,7 +158,6 @@ module.exports = async function handler(req, res) {
     function determineStructure(candles, pivots) {
       let validHighs = [];
       let validLows = [];
-      let trend = 'neutral';
       
       const cleanPivots = [];
       if(pivots.length > 0) cleanPivots.push(pivots[0]);
@@ -183,14 +182,14 @@ module.exports = async function handler(req, res) {
         for (let k = curr.index + 1; k < candles.length; k++) {
           const c = candles[k];
           if (curr.type === 'L') {
-            // Confirm Low by breaking High
+            // Confirm Low by breaking High (UP Trend condition part)
             if (c.close > prev.price) {
               broken = true;
               breakIndex = k;
               break;
             }
           } else {
-            // Confirm High by breaking Low
+            // Confirm High by breaking Low (DOWN Trend condition part)
             if (c.close < prev.price) {
               broken = true;
               breakIndex = k;
@@ -209,18 +208,26 @@ module.exports = async function handler(req, res) {
       const lastValidHigh = validHighs.length > 0 ? validHighs[validHighs.length-1] : null;
       const lastValidLow  = validLows.length > 0 ? validLows[validLows.length-1] : null;
       
-      // Determine trend from last confirmed event
       const events = [...confirmedStruct].sort((a,b) => a.confirmedAt - b.confirmedAt);
       const lastEvent = events[events.length - 1];
       
+      // Strict Trend Definition from Markdown:
+      // Uptrend: Confirmed valid low exists. Price broke previous valid high. Price NOT broken below current valid low.
+      // Downtrend: Confirmed valid high exists. Price broke previous valid low. Price NOT broken above current valid high.
+      
+      // Default neutral
       let calculatedTrend = 'neutral';
+      
+      // Check last confirmed event to set BASE trend
       if (lastEvent) {
-         // If last event was Low (confirmed by breaking High), we are UP
          calculatedTrend = lastEvent.type === 'L' ? 'up' : 'down';
       }
       
-      // Check for live breaks of valid structure
+      // Check for LIVE breaks (Switching logic)
+      // "Trend switches to downtrend when price breaks the current valid low."
+      // "Trend switches to uptrend when price breaks the current valid high."
       const lastClose = candles[candles.length-1].close;
+      
       if (calculatedTrend === 'up' && lastValidLow && lastClose < lastValidLow.price) {
         calculatedTrend = 'down';
       }
@@ -239,6 +246,10 @@ module.exports = async function handler(req, res) {
     function findZones(candles, atrValues) {
       const demandZones = [];
       const supplyZones = [];
+      
+      // Strict Definition:
+      // Consolidation (N candles) -> Impulse
+      // Demand Zone = Low of last consolidation candle to High of last consolidation candle before impulse.
       
       const CONSOLIDATION_LEN = 3; 
       const IMPULSE_MULT = 1.5; 
@@ -260,6 +271,7 @@ module.exports = async function handler(req, res) {
         let lastConsolCandleHigh = -Infinity;
         let lastConsolCandleLow = Infinity;
         
+        // Check previous N candles
         for (let j = 1; j <= CONSOLIDATION_LEN; j++) {
           const c = candles[i - j];
           const range = c.high - c.low;
@@ -267,7 +279,7 @@ module.exports = async function handler(req, res) {
             isConsolidation = false;
             break;
           }
-          if (j === 1) { 
+          if (j === 1) { // The one right before impulse
              lastConsolCandleHigh = c.high;
              lastConsolCandleLow = c.low;
           }
@@ -276,16 +288,12 @@ module.exports = async function handler(req, res) {
         if (isConsolidation) {
           if (isBullishImpulse) {
             demandZones.push({
-              startIdx: i - 1,
-              endIdx: i - 1,
               low: lastConsolCandleLow,
               high: lastConsolCandleHigh,
               impulseIdx: i
             });
           } else {
              supplyZones.push({
-              startIdx: i - 1,
-              endIdx: i - 1,
               low: lastConsolCandleLow,
               high: lastConsolCandleHigh,
               impulseIdx: i
@@ -307,6 +315,7 @@ module.exports = async function handler(req, res) {
       const { demandZones, supplyZones } = findZones(candles, atrValues);
       
       // Filter invalidated zones
+      // Zone is invalid if price broke it in opposite direction AFTER formation
       const validDemand = demandZones.filter(z => {
          for (let k = z.impulseIdx + 1; k < candles.length; k++) {
            if (candles[k].close < z.low) return false;
@@ -348,79 +357,122 @@ module.exports = async function handler(req, res) {
     }
 
     // --------------------------------------------------------------------------
-    // 4. SIGNAL GENERATION (MTF LOGIC)
+    // 4. SIGNAL GENERATION (STRICT)
     // --------------------------------------------------------------------------
-    // Rule: Trend from HTF (4h), Entry from LTF (15m)
     
     let signal = 'HOLD';
-    let entry = null;
-    let sl = null;
-    let tp1 = null;
-    let tp2 = null;
-    let rr = 0;
-    let activeZone = null;
+    let entryPrice = null;
+    let stopLoss = null;
+    let takeProfit1 = null;
+    let takeProfit2 = null;
+    let tradeRR = null;
+    let confidenceScore = 0;
+    let confluenceScore = 0;
     
     const MIN_RR = 2.5;
     const currentPrice = entryTF.lastPrice;
     const trendDirection = trendTF.structure.trend; // 'up' or 'down'
 
-    // Confluence Score (Optional, for output)
-    let confluence = 0;
-    if (tf1d && tf1d.structure.trend === trendDirection) confluence++;
-    if (tf1h && tf1h.structure.trend === trendDirection) confluence++;
+    // Confluence Score Calculation:
+    // +1 for 1D Trend Alignment
+    // +1 for 1H Trend Alignment
+    // +1 for 15M Trend Alignment
+    if (tf1d && tf1d.structure.trend === trendDirection) confluenceScore++;
+    if (tf1h && tf1h.structure.trend === trendDirection) confluenceScore++;
+    if (tf15m && tf15m.structure.trend === trendDirection) confluenceScore++;
     
-    // Trade Logic
+    // Confidence Score Calculation (0-100) based on factors
+    // Base: 50
+    // +20 if Confluence >= 2
+    // +10 if Entry is in very tight zone (Zone range < 0.5% price)
+    // +20 if High RR (> 4)
+    let baseConfidence = 50;
+    if (confluenceScore >= 2) baseConfidence += 20;
+
+    // --- TRADE EXECUTION LOGIC ---
+    
     if (trendDirection === 'up') {
-      // Look for Demand Zones on Entry Timeframe
-      const sortedDemand = entryTF.zones.demand.sort((a,b) => b.low - a.low);
+      // 1. Detect Trend -> UP (Done)
+      // 2. Identify Valid Low (Done in structure)
+      // 3. Detect Demand Zone (Done)
+      // 4. Wait for price retrace into demand zone
+      
+      const sortedDemand = entryTF.zones.demand.sort((a,b) => b.low - a.low); // Nearest (highest) first
       
       for (const z of sortedDemand) {
         // Condition: Price retraces into zone
-        // Strict: currentPrice <= z.high
-        if (currentPrice <= z.high * 1.001 && currentPrice >= z.low * 0.999) {
+        // We define "retrace into zone" as:
+        // Current Price <= Zone High AND Current Price >= Zone Low * 0.99 (slight buffer for wick)
+        // OR simply Price is currently INSIDE the zone.
+        
+        // Strict Check: Price needs to be inside or just touching the zone top
+        // If price is way below zone low, zone is broken (already filtered in validDemand, but double check live price)
+        if (currentPrice < z.low) continue; // Broken live
+        
+        if (currentPrice <= z.high * 1.001) { // touched zone
            const potentialEntry = currentPrice;
-           const potentialSL = z.low * 0.999; 
            
-           // TP from Structure (HTF or LTF?)
-           // Strategy says: "TP: the most recent valid swing high."
-           // Usually we target the LTF swing high for a scalp, or HTF for a swing.
-           // Since entry is LTF, let's use LTF structure first.
+           // 5. Set SL = demand_zone_low
+           const potentialSL = z.low; 
+           
+           // 5. Set TP = previous_valid_high
+           // We prioritize the Entry Timeframe structure for initial targets as per standard scalp rules
+           // But if undefined, check Trend TF
            let targetPrice = entryTF.structure.validHigh ? entryTF.structure.validHigh.price : null;
            
-           // If LTF target is too close or undefined, try HTF target
            if (!targetPrice || targetPrice <= potentialEntry) {
               targetPrice = trendTF.structure.validHigh ? trendTF.structure.validHigh.price : null;
            }
            
-           // Fallback TP: 3R
+           // If still no valid high above (blue sky breakout), use 3R
            if (!targetPrice || targetPrice <= potentialEntry) {
               targetPrice = potentialEntry + (potentialEntry - potentialSL) * 3;
            }
 
+           // 6. Check R:R >= 2.5
            const risk = Math.abs(potentialEntry - potentialSL);
            const reward = Math.abs(targetPrice - potentialEntry);
            
-           if (risk > 0 && (reward / risk) >= MIN_RR) {
-             signal = confluence >= 1 ? 'STRONG BUY' : 'BUY';
-             entry = potentialEntry;
-             sl = potentialSL;
-             tp1 = targetPrice;
-             tp2 = targetPrice + (targetPrice - potentialEntry) * 0.5; // Extension
-             rr = reward / risk;
-             activeZone = z;
-             break;
+           if (risk > 0) {
+             const rr = reward / risk;
+             if (rr >= MIN_RR) {
+               // 7. Execute Long
+               signal = 'LONG';
+               entryPrice = potentialEntry;
+               stopLoss = potentialSL;
+               takeProfit1 = targetPrice;
+               takeProfit2 = targetPrice + (targetPrice - potentialEntry) * 0.5; // Extension
+               tradeRR = Number(rr.toFixed(2));
+               
+               // Confidence Adjustments
+               if ((z.high - z.low) / potentialEntry < 0.005) baseConfidence += 10; // Tight zone
+               if (rr > 4) baseConfidence += 20;
+               confidenceScore = Math.min(100, baseConfidence);
+               
+               break; // Found valid setup
+             }
            }
         }
       }
+      
     } else if (trendDirection === 'down') {
-      // Look for Supply Zones on Entry Timeframe
-      const sortedSupply = entryTF.zones.supply.sort((a,b) => a.high - b.high);
+      // 1. Detect Trend -> DOWN (Done)
+      // 2. Identify Valid High (Done)
+      // 3. Detect Supply Zone (Done)
+      // 4. Wait for price retrace into supply zone
+      
+      const sortedSupply = entryTF.zones.supply.sort((a,b) => a.high - b.high); // Lowest (closest) first
       
       for (const z of sortedSupply) {
-        if (currentPrice >= z.low * 0.999 && currentPrice <= z.high * 1.001) {
+        if (currentPrice > z.high) continue; // Broken live
+        
+        if (currentPrice >= z.low * 0.999) { // touched zone
            const potentialEntry = currentPrice;
-           const potentialSL = z.high * 1.001;
            
+           // 5. Set SL = supply_zone_high
+           const potentialSL = z.high;
+           
+           // 5. Set TP = previous_valid_low
            let targetPrice = entryTF.structure.validLow ? entryTF.structure.validLow.price : null;
            
            if (!targetPrice || targetPrice >= potentialEntry) {
@@ -431,57 +483,50 @@ module.exports = async function handler(req, res) {
               targetPrice = potentialEntry - (potentialSL - potentialEntry) * 3;
            }
            
+           // 6. Check R:R >= 2.5
            const risk = Math.abs(potentialSL - potentialEntry);
            const reward = Math.abs(potentialEntry - targetPrice);
            
-           if (risk > 0 && (reward / risk) >= MIN_RR) {
-             signal = confluence >= 1 ? 'STRONG SELL' : 'SELL';
-             entry = potentialEntry;
-             sl = potentialSL;
-             tp1 = targetPrice;
-             tp2 = targetPrice - (potentialEntry - targetPrice) * 0.5;
-             rr = reward / risk;
-             activeZone = z;
-             break;
+           if (risk > 0) {
+             const rr = reward / risk;
+             if (rr >= MIN_RR) {
+               // 7. Execute Short
+               signal = 'SHORT';
+               entryPrice = potentialEntry;
+               stopLoss = potentialSL;
+               takeProfit1 = targetPrice;
+               takeProfit2 = targetPrice - (potentialEntry - targetPrice) * 0.5;
+               tradeRR = Number(rr.toFixed(2));
+               
+               if ((z.high - z.low) / potentialEntry < 0.005) baseConfidence += 10;
+               if (rr > 4) baseConfidence += 20;
+               confidenceScore = Math.min(100, baseConfidence);
+               
+               break;
+             }
            }
         }
       }
     }
 
-    // Output Formatting
+    // --------------------------------------------------------------------------
+    // 5. FINAL OUTPUT
+    // --------------------------------------------------------------------------
     const output = {
-      symbol,
-      main_trend_tf: trendTF.tf,
-      entry_tf: entryTF.tf,
-      trend: trendDirection.toUpperCase(),
-      current_price: currentPrice,
-      signal,
-      entry: entry ? Number(entry.toFixed(5)) : null,
-      stop_loss: sl ? Number(sl.toFixed(5)) : null,
-      take_profit_1: tp1 ? Number(tp1.toFixed(5)) : null,
-      take_profit_2: tp2 ? Number(tp2.toFixed(5)) : null,
-      rr: rr ? Number(rr.toFixed(2)) : null,
-      
-      mtf_analysis: {
-        '15m': tf15m ? { trend: tf15m.structure.trend, valid_high: tf15m.structure.validHigh?.price, valid_low: tf15m.structure.validLow?.price } : null,
-        '1h':  tf1h  ? { trend: tf1h.structure.trend,  valid_high: tf1h.structure.validHigh?.price,  valid_low: tf1h.structure.validLow?.price } : null,
-        '4h':  tf4h  ? { trend: tf4h.structure.trend,  valid_high: tf4h.structure.validHigh?.price,  valid_low: tf4h.structure.validLow?.price } : null,
-        '1d':  tf1d  ? { trend: tf1d.structure.trend,  valid_high: tf1d.structure.validHigh?.price,  valid_low: tf1d.structure.validLow?.price } : null,
-      },
-      
-      zones: {
-        active_demand: entryTF.zones.demand.length,
-        active_supply: entryTF.zones.supply.length,
-        nearest_demand: entryTF.zones.demand.length ? entryTF.zones.demand[entryTF.zones.demand.length-1] : null,
-        nearest_supply: entryTF.zones.supply.length ? entryTF.zones.supply[entryTF.zones.supply.length-1] : null
-      }
+      "Final Signal": signal,
+      "Trade Close Price": entryPrice ? Number(entryPrice.toFixed(5)) : null,
+      "Stop Loss": stopLoss ? Number(stopLoss.toFixed(5)) : null,
+      "Take Profit 1": takeProfit1 ? Number(takeProfit1.toFixed(5)) : null,
+      "Take Profit 2": takeProfit2 ? Number(takeProfit2.toFixed(5)) : null,
+      "Trade Confidence Score": signal !== 'HOLD' ? confidenceScore : 0,
+      "Confluence Score": confluenceScore,
+      "RR": tradeRR
     };
 
-    return res.status(200).json(output);
+    return res.status(200).json([output]);
 
   } catch (err) {
     console.error('[crypto-indicator] error', err);
     return res.status(500).json({ error: 'Internal Error', details: err.message });
   }
 };
-
