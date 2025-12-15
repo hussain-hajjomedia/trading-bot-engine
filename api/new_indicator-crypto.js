@@ -514,13 +514,13 @@ module.exports = async function handler(req, res) {
     // --------------------------------------------------------------------------
     const output = {
       "Final Signal": signal,
-      "Trade Close Price": entryPrice ? Number(entryPrice.toFixed(5)) : null,
-      "Stop Loss": stopLoss ? Number(stopLoss.toFixed(5)) : null,
-      "Take Profit 1": takeProfit1 ? Number(takeProfit1.toFixed(5)) : null,
-      "Take Profit 2": takeProfit2 ? Number(takeProfit2.toFixed(5)) : null,
+      "Trade Close Price": entryPrice ? Number(entryPrice.toFixed(5)) : 0,
+      "Stop Loss": stopLoss ? Number(stopLoss.toFixed(5)) : 0,
+      "Take Profit 1": takeProfit1 ? Number(takeProfit1.toFixed(5)) : 0,
+      "Take Profit 2": takeProfit2 ? Number(takeProfit2.toFixed(5)) : 0,
       "Trade Confidence Score": signal !== 'HOLD' ? confidenceScore : 0,
       "Confluence Score": confluenceScore,
-      "RR": tradeRR
+      "RR": tradeRR ? tradeRR : 0
     };
 
     return res.status(200).json([output]);
