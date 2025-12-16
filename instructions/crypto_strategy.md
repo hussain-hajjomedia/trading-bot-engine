@@ -1,10 +1,18 @@
 # **Crypto Trading Strategy**
 
-## **1. MARKET STRUCTURE DETECTION**
+## **1. STRATEGY OVERVIEW & TIMEFRAMES**
+
+Goal: High-probability swing trades (1-2 per week) capturing major market moves.
+
+**Timeframes:**
+*   **Trend Determination:** **Daily (1D)**. This is the "Master Trend."
+*   **Entry Execution:** **1-Hour (1H)**. This provides precise entries within the daily trend.
+
+## **2. MARKET STRUCTURE DETECTION**
 
 Goal: Determine if the market is in an **uptrend** or **downtrend**, using a strict rule for what counts as a “valid swing high/low”.
 
-### **1.1 Definitions**
+### **2.1 Definitions**
 
 * **Valid Low (Swing Low)**:
   A low becomes a *valid* swing low **only if price breaks the previous swing high after forming it**.
@@ -13,7 +21,7 @@ Goal: Determine if the market is in an **uptrend** or **downtrend**, using a str
 
 This fixes the main confusion in typical swing detection.
 
-### **1.2 Uptrend Condition**
+### **2.2 Uptrend Condition**
 
 You are in an uptrend when:
 
@@ -21,7 +29,7 @@ You are in an uptrend when:
 * Price has broken the previous valid high.
 * Price has **not** broken below the current valid low.
 
-### **1.3 Downtrend Condition**
+### **2.3 Downtrend Condition**
 
 You are in a downtrend when:
 
@@ -29,12 +37,12 @@ You are in a downtrend when:
 * Price has broken the previous valid low.
 * Price has **not** broken above the current valid high.
 
-### **1.4 Trend Switching Logic**
+### **2.4 Trend Switching Logic**
 
 * Trend switches to **downtrend** when price breaks the current valid low.
 * Trend switches to **uptrend** when price breaks the current valid high.
 
-### **1.5 Swing Identification Algorithm**
+### **2.5 Swing Identification Algorithm**
 
 When price creates a temporary low candidate L:
 
@@ -45,18 +53,16 @@ When price creates a temporary low candidate L:
 
 Same logic for highs.
 
-
-
-## **2. SUPPLY AND DEMAND ZONE DETECTION**
+## **3. SUPPLY AND DEMAND ZONE DETECTION**
 
 After trend direction is known:
 
-### **2.1 Only Use the Zones That Match the Trend**
+### **3.1 Only Use the Zones That Match the Trend**
 
 * Uptrend → use **demand** zones only.
 * Downtrend → use **supply** zones only.
 
-### **2.2 Zone Definition**
+### **3.2 Zone Definition**
 
 A **demand zone** is identified when:
 
@@ -72,7 +78,7 @@ A **demand zone** is identified when:
 
 A **supply zone** is defined the same way but with bearish impulses.
 
-### **2.3 Consolidation Detection Logic (simple version)**
+### **3.3 Consolidation Detection Logic (simple version)**
 
 A consolidation region is:
 
@@ -84,7 +90,7 @@ A consolidation region is:
 
 You can define this numerically in code (I can help).
 
-### **2.4 Impulse Detection Logic**
+### **3.4 Impulse Detection Logic**
 
 An impulse is:
 
@@ -94,51 +100,43 @@ An impulse is:
 
 We can formalize it if needed.
 
+## **4. ENTRY RULES**
 
-
-## **3. ENTRY RULES**
-
-### **3.1 Entry in Uptrend**
+### **4.1 Entry in Uptrend**
 
 Enter long when:
 
-1. Trend = uptrend.
-2. A demand zone is identified.
+1. Trend (Daily) = uptrend.
+2. A demand zone is identified on the Entry Timeframe (1H).
 3. Price retraces into that demand zone.
 4. Entry trigger:
+   * **Touch Entry:** Enter when price touches the top of the zone.
+   * **Stop Loss Buffer:** Ensure SL is set slightly below the zone to avoid wick-outs.
 
-   * You can enter immediately when price touches the zone, or
-   * Require a confirmation candle (e.g., bullish engulfing inside the zone).
-
-### **3.2 Entry in Downtrend**
+### **4.2 Entry in Downtrend**
 
 Enter short when:
 
-1. Trend = downtrend.
-2. A supply zone is identified.
+1. Trend (Daily) = downtrend.
+2. A supply zone is identified on the Entry Timeframe (1H).
 3. Price retraces into that supply zone.
 4. Entry trigger:
+   * **Touch Entry:** Enter when price touches the bottom of the zone.
+   * **Stop Loss Buffer:** Ensure SL is set slightly above the zone.
 
-   * Enter on first touch, or
-   * Require a bearish confirmation candle.
+## **5. STOP LOSS (SL) AND TAKE PROFIT (TP)**
 
+### **5.1 In Uptrend**
 
+* **Stop Loss**: Just below the demand zone low + **0.2% Buffer**.
+* **TP**: The most recent valid swing high.
 
-## **4. STOP LOSS (SL) AND TAKE PROFIT (TP)**
+### **5.2 In Downtrend**
 
-### **4.1 In Uptrend**
+* **SL**: Just above the supply zone high + **0.2% Buffer**.
+* **TP**: The most recent valid swing low.
 
-* **Stop Loss**: just below the demand zone low.
-* **TP**: the most recent valid swing high.
-
-### **4.2 In Downtrend**
-
-* SL: just above the supply zone high.
-* TP: the most recent valid swing low.
-
-
-
-## **5. RISK TO REWARD FILTER (R:R ≥ 2.5:1)**
+## **6. RISK TO REWARD FILTER (R:R ≥ 2.0:1)**
 
 After SL and TP are calculated:
 
@@ -147,16 +145,14 @@ After SL and TP are calculated:
 * If
 
   ```
-  reward / risk < 2.5
+  reward / risk < 2.0
   ```
 
   → **Do NOT take the trade.**
 
-Trades only execute when R:R ≥ 2.5.
+Trades only execute when R:R ≥ 2.0.
 
-
-
-## **6. COMPLETE TRADE EXECUTION LOGIC**
+## **7. COMPLETE TRADE EXECUTION LOGIC**
 
 Putting it all together:
 
@@ -168,9 +164,9 @@ Putting it all together:
 4. Wait for price retrace into demand zone.
 5. Set:
 
-   * SL = demand_zone_low
+   * SL = demand_zone_low - (price * 0.002)
    * TP = previous_valid_high
-6. Check R:R ≥ 2.5.
+6. Check R:R ≥ 2.0.
 7. If true → execute long.
 
 ### **For Short Trades:**
@@ -181,14 +177,12 @@ Putting it all together:
 4. Wait for price retrace into supply zone.
 5. Set:
 
-   * SL = supply_zone_high
+   * SL = supply_zone_high + (price * 0.002)
    * TP = previous_valid_low
-6. Check R:R ≥ 2.5.
+6. Check R:R ≥ 2.0.
 7. If true → execute short.
 
-
-
-## **7. DATA STRUCTURES YOU’LL NEED IN CODE**
+## **8. DATA STRUCTURES YOU’LL NEED IN CODE**
 
 Here is what your algorithm needs to track:
 
@@ -206,9 +200,7 @@ supply_zones: list of zones
 active_trade: None or {entry, sl, tp, direction}
 ```
 
-
-
-## **8. SIGNAL OUTPUT**
+## **9. SIGNAL OUTPUT**
 
 The engine will output the following signals:
 
@@ -220,4 +212,3 @@ TAKE PROFIT 1: <price>
 TAKE PROFIT 2: <price>  
 RR: <value>  
 ```
-

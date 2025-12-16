@@ -342,15 +342,17 @@ module.exports = async function handler(req, res) {
     // --------------------------------------------------------------------------
     // 3. MULTI-TIMEFRAME ANALYSIS
     // --------------------------------------------------------------------------
+    // REVISED STRATEGY: Daily Trend + 1H Entry for high-quality swing setups.
     const tf15m = analyzeTimeframe(kline_15m, '15m');
     const tf1h  = analyzeTimeframe(kline_1h,  '1h');
     const tf4h  = analyzeTimeframe(kline_4h,  '4h');
     const tf1d  = analyzeTimeframe(kline_1d,  '1d');
 
-    // fallback for trend if 4h missing
-    const trendTF = tf4h || tf1h || tf15m;
-    // fallback for entry if 15m missing
-    const entryTF = tf15m || tf1h;
+    // Trend Timeframe: Prioritize Daily (1d) -> 4H -> 1H
+    const trendTF = tf1d || tf4h || tf1h;
+    
+    // Entry Timeframe: Prioritize 1H (1h) -> 15m
+    const entryTF = tf1h || tf15m || tf4h;
     
     if (!trendTF || !entryTF) {
        return res.status(400).json({ error: 'Insufficient data for analysis' });
@@ -369,9 +371,58 @@ module.exports = async function handler(req, res) {
     let confidenceScore = 0;
     let confluenceScore = 0;
     
-    const MIN_RR = 2.5;
+    const MIN_RR = 2.0; // Slightly adjusted for wider stops (Buffer)
+    const BUFFER_PCT = 0.002; // 0.2% Buffer for Stop Hunts
+    
     const currentPrice = entryTF.lastPrice;
     const trendDirection = trendTF.structure.trend; // 'up' or 'down'
+
+    // PREMIUM / DISCOUNT FILTER
+    let equilibriumPrice = null;
+    let inPremium = false;
+    let inDiscount = false;
+    
+    // Determine active trading range on Trend Timeframe
+    if (trendDirection === 'up' && trendTF.structure.validLow) {
+      // Range: Valid Low -> Highest High since Valid Low
+      // If validHigh exists and is after validLow, use it. Otherwise find highest high since validLow index.
+      let rangeLow = trendTF.structure.validLow.price;
+      let rangeHigh = -Infinity;
+      
+      // Look for highest point since the low
+      // validLow.index is the pivot index in the candles array
+      if (trendTF.structure.validHigh && trendTF.structure.validHigh.index > trendTF.structure.validLow.index) {
+          rangeHigh = trendTF.structure.validHigh.price;
+      } else {
+          // Find live highest high since the low
+          for(let k = trendTF.structure.validLow.index; k < trendTF.candles.length; k++) {
+              if (trendTF.candles[k].high > rangeHigh) rangeHigh = trendTF.candles[k].high;
+          }
+      }
+      
+      if (Number.isFinite(rangeLow) && Number.isFinite(rangeHigh) && rangeHigh > rangeLow) {
+         equilibriumPrice = (rangeLow + rangeHigh) / 2;
+         inDiscount = currentPrice < equilibriumPrice;
+      }
+      
+    } else if (trendDirection === 'down' && trendTF.structure.validHigh) {
+      // Range: Valid High -> Lowest Low since Valid High
+      let rangeHigh = trendTF.structure.validHigh.price;
+      let rangeLow = Infinity;
+      
+      if (trendTF.structure.validLow && trendTF.structure.validLow.index > trendTF.structure.validHigh.index) {
+          rangeLow = trendTF.structure.validLow.price;
+      } else {
+          for(let k = trendTF.structure.validHigh.index; k < trendTF.candles.length; k++) {
+              if (trendTF.candles[k].low < rangeLow) rangeLow = trendTF.candles[k].low;
+          }
+      }
+
+      if (Number.isFinite(rangeLow) && Number.isFinite(rangeHigh) && rangeHigh > rangeLow) {
+         equilibriumPrice = (rangeLow + rangeHigh) / 2;
+         inPremium = currentPrice > equilibriumPrice;
+      }
+    }
 
     // Confluence Score Calculation:
     // +1 for 1D Trend Alignment
@@ -392,6 +443,18 @@ module.exports = async function handler(req, res) {
     // --- TRADE EXECUTION LOGIC ---
     
     if (trendDirection === 'up') {
+      // 0. Filter: Must be in DISCOUNT (Lower 50%)
+      // If equilibrium is defined, strictly require price < equilibrium
+      if (equilibriumPrice !== null && !inDiscount) {
+         // IGNORE TRADES (Buying at Premium)
+         // But we continue to check loop? No, the signal is INVALID.
+         // However, we should verify if ANY zone satisfies the condition? 
+         // The filter is on ENTRY PRICE. Zones might be lower.
+         // But logic says: "If Entry Price > equilibrium_price, DISCARD...". 
+         // Entry Price is roughly Current Price when "retracing into zone".
+         // Actually, "potentialEntry" is the price we execute at.
+      } else {
+
       // 1. Detect Trend -> UP (Done)
       // 2. Identify Valid Low (Done in structure)
       // 3. Detect Demand Zone (Done)
@@ -401,19 +464,16 @@ module.exports = async function handler(req, res) {
       
       for (const z of sortedDemand) {
         // Condition: Price retraces into zone
-        // We define "retrace into zone" as:
-        // Current Price <= Zone High AND Current Price >= Zone Low * 0.99 (slight buffer for wick)
-        // OR simply Price is currently INSIDE the zone.
-        
-        // Strict Check: Price needs to be inside or just touching the zone top
-        // If price is way below zone low, zone is broken (already filtered in validDemand, but double check live price)
         if (currentPrice < z.low) continue; // Broken live
         
         if (currentPrice <= z.high * 1.001) { // touched zone
            const potentialEntry = currentPrice;
            
-           // 5. Set SL = demand_zone_low
-           const potentialSL = z.low; 
+           // Apply Discount Filter on actual Entry Price
+           if (equilibriumPrice !== null && potentialEntry >= equilibriumPrice) continue;
+
+           // 5. Set SL = demand_zone_low - BUFFER
+           const potentialSL = z.low * (1 - BUFFER_PCT); 
            
            // 5. Set TP = previous_valid_high
            // We prioritize the Entry Timeframe structure for initial targets as per standard scalp rules
@@ -429,7 +489,7 @@ module.exports = async function handler(req, res) {
               targetPrice = potentialEntry + (potentialEntry - potentialSL) * 3;
            }
 
-           // 6. Check R:R >= 2.5
+           // 6. Check R:R >= MIN_RR
            const risk = Math.abs(potentialEntry - potentialSL);
            const reward = Math.abs(targetPrice - potentialEntry);
            
@@ -454,8 +514,14 @@ module.exports = async function handler(req, res) {
            }
         }
       }
-      
+    }
+    
     } else if (trendDirection === 'down') {
+      // 0. Filter: Must be in PREMIUM (Upper 50%)
+      if (equilibriumPrice !== null && !inPremium) {
+         // IGNORE TRADES (Selling at Discount)
+      } else {
+
       // 1. Detect Trend -> DOWN (Done)
       // 2. Identify Valid High (Done)
       // 3. Detect Supply Zone (Done)
@@ -469,8 +535,11 @@ module.exports = async function handler(req, res) {
         if (currentPrice >= z.low * 0.999) { // touched zone
            const potentialEntry = currentPrice;
            
-           // 5. Set SL = supply_zone_high
-           const potentialSL = z.high;
+           // Apply Premium Filter on actual Entry Price
+           if (equilibriumPrice !== null && potentialEntry <= equilibriumPrice) continue;
+           
+           // 5. Set SL = supply_zone_high + BUFFER
+           const potentialSL = z.high * (1 + BUFFER_PCT);
            
            // 5. Set TP = previous_valid_low
            let targetPrice = entryTF.structure.validLow ? entryTF.structure.validLow.price : null;
@@ -483,7 +552,7 @@ module.exports = async function handler(req, res) {
               targetPrice = potentialEntry - (potentialSL - potentialEntry) * 3;
            }
            
-           // 6. Check R:R >= 2.5
+           // 6. Check R:R >= MIN_RR
            const risk = Math.abs(potentialSL - potentialEntry);
            const reward = Math.abs(potentialEntry - targetPrice);
            
@@ -508,6 +577,7 @@ module.exports = async function handler(req, res) {
         }
       }
     }
+  }
 
     // --------------------------------------------------------------------------
     // 5. FINAL OUTPUT
